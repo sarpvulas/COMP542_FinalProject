@@ -22,6 +22,10 @@ cd your-repository
 pip install -r requirements.txt
 ```
 
+## Data Preprocessing 
+
+Data preprocessing is done using the related notebook. Chatgpt API was also accessed through this notebook. For privacy reasons, the api-key is not present.
+
 ## T5 Models
 
 ### T5 Model Training on Hexagons Dataset
