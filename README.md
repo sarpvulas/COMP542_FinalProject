@@ -56,10 +56,10 @@ All scripts are in `Project/`; shared helpers (seed, T5 prompt, metrics, class w
 
 ### T5: board prediction
 
-T5 predicts the board state from the instruction, the paper's "instruction-to-execution" task (Lachmy et al., arXiv:2106.14321). The project owner confirmed this task.
+T5 predicts the board state from the instruction, the paper's "instruction-to-execution" task (Lachmy et al., arXiv:2106.14321). The original code pointed both ways: the original `inference.py` was written for instruction simplification (prompt `simplify instructions:`, output column `simplified_instructions`), while the original training code read `resulting_label_list`. The project owner (a co-author) confirmed board prediction.
 
-- **Input**: `draw board: ` followed by the drawing's instructions up to the current step, joined with ` [SEP] ` (the same history the classifiers use). The original T5 code never fed a board into the model (only `t5_instr` and, optionally, the abstraction level), so the previous board is not an input; the instruction history carries it. With `--include_abstraction_level` the input is prefixed with `Abstraction Level: <level> `.
-- **Target** (`resulting_label_list`): the board after the step, 10 rows x 18 columns in the dataset's row-major order, each row as 18 labels (0 to 7) separated by spaces and the rows joined with ` / `. `board_text.parse_board` is the exact inverse of `render_board`; anything with the wrong number of rows or cells, or a label outside 0 to 7, is malformed.
+- **Input**: `draw board: ` followed by the drawing's instructions up to the current step, joined with ` [SEP] `. This history is this repository's choice, copied from the classifiers' `input_strings` construction: the original T5 code never defined `t5_instr` (the original notebook never creates the four T5 columns) and never fed a board into the model, so the previous board is not an input; the instruction history carries it. Inputs longer than `--max_length` are truncated from the left, so the current step's instruction survives. With `--include_abstraction_level` the input is prefixed with `Abstraction Level: <level> `.
+- **Target** (`resulting_label_list`): the board after the step, 10 rows x 18 columns in the dataset's row-major order, each row as 18 labels (0 to 7) separated by spaces and the rows joined with ` / `. `board_text.parse_board` is the exact inverse of `render_board`; anything with the wrong number of rows or cells, or a label that is not an ASCII integer from 0 to 7, is malformed. On the real data, `prepare_t5_data.py` gives 4,176 rows (4,177 raw; one empty instruction is dropped).
 - **No-colour variant** (`--no_color`): input from the GPT-4o colour-free instructions (`no_color` column of the notebook), target `resulting_label_list_no_color`: labels 1 to 7 (every paint colour) collapse to 1 (filled), 0 stays 0 (unfilled). A cell painted white cannot be told from an empty cell (both are 0 in the data). The abstraction flag is ignored in this variant, as in the original code.
 - **Scoring** (`inference.py`): the generated text is parsed; malformed outputs are counted and listed (index and reason in `--metrics_file`), never raised. Cell accuracy is correct cells over all cells, a malformed output counting as all cells wrong; exact match is the share of drawing steps whose whole board is right. The score also prints the cell accuracy of an always-empty board, because most cells are 0.
 
@@ -73,7 +73,7 @@ Python, PyTorch, Hugging Face Transformers, pandas, scikit-learn, pytest (tests)
 pip install -r requirements.txt
 ```
 
-`requirements.txt` uses lower bounds set to the versions installed and checked in a Python 3.12 venv. To run the notebook, also install `jupyter` (or `ipykernel`); it is not in `requirements.txt`.
+`requirements.txt` uses lower bounds set to the versions installed and checked in a Python 3.12 venv. To run the notebook, also install `jupyter` (or `ipykernel`); it is not in `requirements.txt`. `protobuf` is listed because the tokenizer of the default T5 model (`google/t5-v1_1-base`) does not load without it (checked in a clean venv: it fails without protobuf and loads and round-trips a board text with it).
 
 Tests (CPU, tiny synthetic data, no downloads, no network):
 
@@ -115,7 +115,7 @@ Class imbalance: most per-cell labels are 0, so accuracy alone misleads. `--clas
 ## Limitations
 
 - Course project, not a maintained library. CI is not set up; tests are run locally only.
-- T5 board prediction has no result here: only a one-step `t5-small` smoke run was done. The T5 input is the instruction history without the previous board, so the model must rebuild the whole board from text; the token length of the board text (235 `t5-small` tokens in the one example measured) and of long histories is close to the 512 default limit.
+- T5 board prediction has no result here: only a one-step `t5-small` smoke run was done. The T5 input is the instruction history without the previous board, so the model must rebuild the whole board from text; board texts are 199 to 379 `t5-small` tokens (mean about 345, measured on the 4,176 prepared rows), so every board fits in the 512 default, but 55 of the 4,176 prepared inputs (1.3%, longest 724 tokens) exceed 512. Those are cut from the left, so they keep the current step's instruction and lose their earliest history.
 - The no-colour T5 input depends on the unreviewed GPT-4o colour-free instructions, and the notebook's repairs of mismatched drawings were done by hand.
 - The GPT-4o simplified instructions that the notebook can still produce are not used by any script.
 - The classifier input carries no board state, only the cell position and the instruction history. This is a design weakness and was not changed.
