@@ -4,6 +4,8 @@ from transformers import T5Tokenizer, T5ForConditionalGeneration
 import time
 import argparse
 
+from hexagons_common import build_t5_input, with_abstraction_level
+
 def load_model_and_tokenizer(model_path, device):
     model = T5ForConditionalGeneration.from_pretrained(model_path).to(device)
     tokenizer = T5Tokenizer.from_pretrained(model_path)
@@ -47,8 +49,12 @@ def main(args):
         batch_start = batch_num * batch_size
         batch_end = min((batch_num + 1) * batch_size, total_instances)
         batch_indices = range(batch_start, batch_end)
-        instructions = df.loc[batch_indices, 'instructions'].tolist()
-        input_texts = [f"simplify instructions: {instr} simplified_instructions: " for instr in instructions]
+        instructions = df.loc[batch_indices, args.instruction_column].tolist()
+        # Same prompt as the training input (hexagons_common.build_t5_input).
+        input_texts = [build_t5_input(instr) for instr in instructions]
+        if args.include_abstraction_level:
+            levels = df.loc[batch_indices, 'abstraction_level'].tolist()
+            input_texts = [with_abstraction_level(text, level) for text, level in zip(input_texts, levels)]
 
         results = generate_inference_batch(model, tokenizer, input_texts, device)
         for idx, result in zip(batch_indices, results):
@@ -77,6 +83,10 @@ if __name__ == "__main__":
     parser.add_argument('--model_path', type=str, required=True, help='Path to the pre-trained T5 model.')
     parser.add_argument('--batch_size', type=int, default=100, help='Batch size for processing.')
     parser.add_argument('--show_time_remaining', action='store_true', help='Show estimated time remaining for processing.')
+    parser.add_argument('--instruction_column', type=str, default='instructions',
+                        help='Column holding the instruction to simplify.')
+    parser.add_argument('--include_abstraction_level', action='store_true',
+                        help='Prefix the abstraction level (use for a model trained with the same flag).')
     parser.add_argument('--input_file', type=str, required=True, help='Path to the input Excel file.')
     parser.add_argument('--output_file', type=str, required=True, help='Path to save the output Excel file.')
 
