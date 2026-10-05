@@ -61,7 +61,7 @@ class TextDataset(Dataset):
 model_id = "microsoft/mdeberta-v3-base"
 
 tokenizer = AutoTokenizer.from_pretrained(model_id)
-model = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=5)
+model = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=4)
 
 # Create dataset objects
 train_dataset = TextDataset(train_df, tokenizer)
@@ -77,6 +77,7 @@ loss_fn = CrossEntropyLoss()
 # Setup device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using {device} for training")
+model.to(device)
 
 model_save_path = "deberta_abstraction"
 
