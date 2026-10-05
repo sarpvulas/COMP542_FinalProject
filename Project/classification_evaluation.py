@@ -19,7 +19,7 @@ model_id = "microsoft/mdeberta-v3-base"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=8)
 
-state_dict = torch.load('model.pth')
+state_dict = torch.load('model.pth', map_location=device)
 model.load_state_dict(state_dict)
 
 if torch.cuda.device_count() > 1:
@@ -57,7 +57,7 @@ class HexagonsDataset(Dataset):
 all_dataset = HexagonsDataset(df, tokenizer)
 
 # Create dataloaders
-all_loader = DataLoader(all_dataset, batch_size=25, shuffle=True)
+all_loader = DataLoader(all_dataset, batch_size=25, shuffle=False)
 
 def get_all_predictions(model, data_loader, device):
     model = model.eval()  # Set the model to evaluation mode
