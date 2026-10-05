@@ -8,11 +8,13 @@ The Hexagons dataset pairs human-written instructions with the board state they 
 
 ## Results
 
-These are **limited CPU runs**, not tuned and not the project's final models. Hardware: Apple M3 Max, CPU only, PyTorch 2.10, Transformers 5.2. Seed 42, 20 epochs, batch 256, final-epoch weights (no early stopping). Input: the Hexagons jsonl files flattened as in the notebook's `process_file` (no GPT columns are needed by the BiLSTM); 4,177 steps (train 3,278, dev 446, test 453), of which 1 train row with a missing instruction is dropped by the script (train n = 3,277). Four abstraction groups: simple / symmetry+other / composed objects+conditions+none / iteration+recursion.
+These are **limited CPU runs**, not tuned and not the project's final models. Hardware: Apple M3 Max, CPU only, PyTorch 2.10, Transformers 5.2. Seed 42, 20 epochs, batch 256, final-epoch weights (no early stopping). Input: the Hexagons jsonl files flattened as in the notebook's `process_file` (no GPT columns are needed by the BiLSTM); 4,177 steps (train 3,278, dev 446, test 453), of which 1 train row with a missing instruction is dropped by the script (train n = 3,277). Four abstraction groups: 0 simple; 1 symmetry + other; 2 composed objects + conditions + `NONE`; 3 bounded / conditional iteration + recursion. The groups are mixed: `NONE` marks second-round drawings that have no category (1,223 of 4,176 rows, about 29%), and group 2 is the majority class (1,509 of 3,277 train rows, about 46%). The classifier therefore partly separates "no category" from the others and does not measure abstraction alone. Also, 22 of 446 dev and 18 of 453 test instructions appear verbatim in train (short texts), so some overlap is expected.
 
-Command (from `Project/`, with `df_no_color.xlsx` holding `instructions`, `abstraction_level`, `dataset`):
+Reproduce without any API key. `make_abstraction_xlsx.py` builds the input (columns `instructions`, `abstraction_level`, `dataset`, and the row index in the first column, which the loader reads with `index_col=0`) from a clone of the public Hexagons repository, using the notebook's `process_file` logic; the file is derived from the dataset, so do not commit it. Commands, from `Project/`:
 
 ```bash
+git clone https://github.com/OnlpLab/Hexagons.git
+python make_abstraction_xlsx.py --hexagons_dir Hexagons --output_file df_no_color.xlsx
 python lstm_abs.py --seed 42 --epochs 20                    # run 1, 7 min 44 s wall clock
 python lstm_abs.py --seed 42 --epochs 20 --class_weighted   # run 2, 8 min 41 s wall clock
 ```
@@ -25,7 +27,7 @@ BiLSTM abstraction classifier, dev / test, with the majority-class baseline (alw
 | BiLSTM, unweighted loss | 0.5381 | 0.4397 | 0.5342 | 0.3516 |
 | BiLSTM, `--class_weighted` | 0.4709 | 0.3979 | 0.4503 | 0.3734 |
 
-Reading: the BiLSTM barely beats the majority baseline on accuracy but clearly beats it on macro-F1. The training accuracy at the last epoch (0.84 unweighted) against dev (0.54) shows overfitting, and dev loss rose from epoch 2 on; one seed, no variance estimate. Class weighting lowers accuracy and gives a similar macro-F1 (higher on test, lower on dev); with one seed this difference is not established.
+Reading: the BiLSTM barely beats the majority baseline on accuracy but clearly beats it on macro-F1. The training accuracy at the last epoch (0.84 unweighted) against dev (0.54) shows overfitting, and dev loss rose from epoch 2 on; one seed, no variance estimate. Class weighting lowers accuracy and gives a similar macro-F1 (higher on test, lower on dev); with one seed this difference is not established. The unweighted run was reproduced exactly by an independent run; the class-weighted numbers were produced once, with one seed, and nobody has re-run them independently.
 
 Only the BiLSTM abstraction classifier was run on real data. T5: `prepare_t5_data.py` and `T5_Training.py` ran one step end to end with `t5-small` on CPU (`--epochs 1 --max_batches 1 --batch_size 2 --max_length 64`), on the real instructions with the instruction itself as a placeholder target, to check that the code runs (test loss 0.54 on one batch). That loss is a smoke check, not a result.
 
@@ -54,7 +56,11 @@ All scripts are in `Project/`; shared helpers (seed, T5 prompt, GPT merge, metri
 
 ### T5 task decision
 
-The code decodes to `simplified_instructions`, the notebook's GPT-4o step produces simplified instructions, and the paper's setting is grounding abstract instructions; the earlier training target (the 180-cell board state as text) matched none of that. This repository therefore treats T5 as **instruction simplification**: input `simplify instructions: <one instruction>`, target the GPT-4o simplified rewrite of that step. The `no_color` variant takes the GPT-4o colour-free instruction as input and the simplified target with colour words removed by a fixed word list (`strip_colors`, not GPT). Board-state prediction is not trained any more. TODO(sarp): confirm this is the task your report intends.
+What the sources say. The paper (arXiv:2106.14321) derives an "instruction-to-execution task", which is predicting the board state from the instructions; the old T5 target (the 180-cell board state as text) and the per-cell classifiers match that task. Pointing the other way: the earlier README (by Egecan Esen) says "T5 for instruction simplification", the old `inference.py` wrote a `simplified_instructions` column, and the notebook builds GPT-4o simplified instructions. The original code was internally inconsistent (board-state target, simplification-style inference), so either could have been meant.
+
+Decision of this repository, not confirmed by the authors: T5 is trained here as **instruction simplification**: input `simplify instructions: <one instruction>`, target the GPT-4o simplified rewrite of that step. The `no_color` variant takes the GPT-4o colour-free instruction as input and, as target, the simplified text with colour words removed by a fixed word list (`strip_colors`, not GPT). Board-state prediction is no longer trained by `T5_Training.py`; the per-cell classifiers still cover that task. TODO(sarp): confirm with Egecan Esen which task the project intends; if it is board-state prediction, revert the T5 target.
+
+The rule-based no-colour target can read badly. Examples (from the tests): "Make the hexagon green instead of red" becomes "Make the hexagon instead of"; "colour of the sky" is left unchanged because only listed colour words are removed. Lists ("green and yellow"), hyphenated ("Red-orange") and capitalised colours are handled, and "white" (the empty cell) is kept on purpose. Treat no-colour T5 results with that in mind.
 
 ## Tech stack
 
@@ -78,6 +84,7 @@ python -m pytest tests -q
 What was and was not run:
 
 - Run: the tests above, `py_compile` and `pyflakes` on every script, and the BiLSTM abstraction classifier on the real Hexagons data on CPU (see Results). A one-step `t5-small` smoke run of `prepare_t5_data.py` and `T5_Training.py` is described under Results.
+- `make_abstraction_xlsx.py` was run on the real Hexagons data; its output has the same instructions, levels, splits, drawing ids and steps as the file used for the numbers below.
 - Never run on real data: the three `classificationbased*.py` scripts, `classification_evaluation.py`, `deberta_abs.py` (mDeBERTa on CPU is too slow here), and `inference.py`. Their training / prediction code is exercised only through a tiny randomly initialised DeBERTa in the tests. The notebook's OpenAI cells were not run.
 
 Usage:
@@ -87,7 +94,7 @@ cd Project
 # 1. run Data Preprocess.ipynb (needs the Hexagons data and `export OPENAI_API_KEY=...`); it writes df_no_color.xlsx and expanded_df_final.xlsx
 python prepare_t5_data.py --input_file df_no_color.xlsx --output_file t5_data.xlsx
 python T5_Training.py --data_file t5_data.xlsx --include_abstraction_level --epochs 50 --seed 42   # or --no_color; with --no_color the abstraction flag is ignored
-python inference.py --device cuda --model_path path/to/model --batch_size 100 --show_time_remaining --input_file in.xlsx --output_file out.xlsx   # add --include_abstraction_level if trained with it
+python inference.py --device cuda --model_path path/to/model --batch_size 100 --show_time_remaining --input_file in.xlsx --output_file out.xlsx   # add --include_abstraction_level if trained with it; a --no_color model needs --instruction_column no_color
 python classificationbased.py --seed 42 [--class_weighted]   # also classificationbased_nocolor.py, classificationbased-abstraction.py
 python classification_evaluation.py --variant color   # or nocolor / abstraction
 python deberta_abs.py --seed 42 [--class_weighted]
@@ -108,7 +115,8 @@ Class imbalance: most per-cell labels are 0, so accuracy alone misleads. `--clas
 
 - Course project, not a maintained library. CI is not set up; tests are run locally only.
 - The T5 task was changed to instruction simplification (see above). It has not been trained on the real GPT-4o targets here, so there is no T5 result. The GPT-4o simplified text is unreviewed, and drawings whose GPT output has the wrong step count are dropped, not repaired.
-- The no-colour T5 target is made by a fixed colour-word list, so it leaves colour-implying phrases (for example "the colour of the sky") and strips colour words used in any sense.
+- The no-colour T5 target is rule-based: it strips listed colour words in any sense, ignores unlisted colour phrases ("the colour of the sky"), and can leave ungrammatical text (examples above).
+- The GPT simplification prompt sees the whole drawing and writes standalone steps (for example "Column 9, Row 6" for "that one"), while T5 gets a single instruction, so context-dependent targets cannot be predicted from the input. The original design had this too.
 - The classifier input carries no board state, only the cell position and the instruction history. This is a design weakness and was not changed.
 - Class weighting is optional and off by default; per-class metrics (beyond macro-F1) are not reported.
 - Changed behaviour in this version (not validated against the authors' earlier runs): the BiLSTM output now ignores padding; `classification_evaluation.py` predicts dev and test only unless `--splits` says otherwise; the T5 target and prompt changed; `T5_Training.py` loads the model inside `main` and evaluates the best checkpoint on the test split.
