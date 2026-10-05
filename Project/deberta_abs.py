@@ -3,7 +3,9 @@ from torch.utils.data import DataLoader, Dataset
 from torch.optim import AdamW, Adam
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from transformers import get_scheduler
+import numpy as np
 import pandas as pd
+from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 from torch.optim import Adam
 from torch.nn import CrossEntropyLoss
@@ -63,7 +65,7 @@ model = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=
 
 # Create dataset objects
 train_dataset = TextDataset(train_df, tokenizer)
-valid_dataset = TextDataset(valid_df, tokenizer)
+valid_dataset = TextDataset(dev_df, tokenizer)
 
 # Create dataloaders
 train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
