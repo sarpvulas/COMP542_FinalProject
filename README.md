@@ -4,13 +4,32 @@ Course project (Koç University, COMP 542): grounding natural-language drawing i
 
 ## TL;DR
 
-The Hexagons dataset pairs human-written instructions with the board state they produce on an 18 x 10 hexagon grid, at different levels of abstraction. This repository holds the code for a data-preparation notebook (GPT-4o is used to strip colour words and to simplify instructions), a T5 training and inference script, and DeBERTa / BiLSTM classifiers that predict per-cell actions and the abstraction level of an instruction. No results are recorded in this repository, so no headline numbers are claimed.
+The Hexagons dataset pairs human-written instructions with the board state they produce on an 18 x 10 hexagon grid, at different levels of abstraction. This repository holds the code for a data-preparation notebook (GPT-4o is used to strip colour words and to simplify instructions), a T5 instruction-simplification pipeline (data prep, training, inference), and DeBERTa / BiLSTM classifiers that predict per-cell actions and the abstraction level of an instruction. The only results recorded are limited CPU runs of the BiLSTM abstraction classifier (see Results); the DeBERTa and T5 models have not been run here.
 
 ## Results
 
-TODO(sarp): add results table (accuracy / macro-F1 per model and split; the scripts print them but no outputs or logs were committed).
+These are **limited CPU runs**, not tuned and not the project's final models. Hardware: Apple M3 Max, CPU only, PyTorch 2.10, Transformers 5.2. Seed 42, 20 epochs, batch 256, final-epoch weights (no early stopping). Input: the Hexagons jsonl files flattened as in the notebook's `process_file` (no GPT columns are needed by the BiLSTM); 4,177 steps (train 3,278, dev 446, test 453), of which 1 train row with a missing instruction is dropped by the script (train n = 3,277). Four abstraction groups: simple / symmetry+other / composed objects+conditions+none / iteration+recursion.
 
-The only numbers in the repo are dataset statistics, printed by `Project/Data Preprocess.ipynb`: 4,177 instruction steps (train 3,278, dev 446, test 453).
+Command (from `Project/`, with `df_no_color.xlsx` holding `instructions`, `abstraction_level`, `dataset`):
+
+```bash
+python lstm_abs.py --seed 42 --epochs 20                    # run 1, 7 min 44 s wall clock
+python lstm_abs.py --seed 42 --epochs 20 --class_weighted   # run 2, 8 min 41 s wall clock
+```
+
+BiLSTM abstraction classifier, dev / test, with the majority-class baseline (always predict the most frequent train group):
+
+| Run | Dev accuracy | Dev macro-F1 | Test accuracy | Test macro-F1 |
+|-----|--------------|--------------|---------------|---------------|
+| Majority-class baseline | 0.5269 | 0.1725 | 0.5298 | 0.1732 |
+| BiLSTM, unweighted loss | 0.5381 | 0.4397 | 0.5342 | 0.3516 |
+| BiLSTM, `--class_weighted` | 0.4709 | 0.3979 | 0.4503 | 0.3734 |
+
+Reading: the BiLSTM barely beats the majority baseline on accuracy but clearly beats it on macro-F1. The training accuracy at the last epoch (0.84 unweighted) against dev (0.54) shows overfitting, and dev loss rose from epoch 2 on; one seed, no variance estimate. Class weighting lowers accuracy and gives a similar macro-F1 (higher on test, lower on dev); with one seed this difference is not established.
+
+Only the BiLSTM abstraction classifier was run on real data. T5: `prepare_t5_data.py` and `T5_Training.py` ran one step end to end with `t5-small` on CPU (`--epochs 1 --max_batches 1 --batch_size 2 --max_length 64`), on the real instructions with the instruction itself as a placeholder target, to check that the code runs (test loss 0.54 on one batch). That loss is a smoke check, not a result.
+
+TODO(sarp): DeBERTa results (action classifiers and `deberta_abs.py`) and T5 results with the real GPT-4o targets, to be run on a GPU.
 
 ## Data
 
@@ -20,22 +39,26 @@ Citation:
 
 > Royi Lachmy, Valentina Pyatkin, Avshalom Manevich, Reut Tsarfaty. *Draw Me a Flower: Processing and Grounding Abstraction in Natural Language.* Transactions of the ACL, 2022. [arXiv:2106.14321](https://arxiv.org/abs/2106.14321)
 
-The dataset repository is MIT-licensed and its page states CC-BY 4.0 for its resources; check its terms before redistributing any derived files.
+The dataset repository carries an MIT LICENSE file, and its README states CC-BY 4.0 for its resources and restricts use to research and academic purposes. This repository does not contain the dataset or any file derived from it (no data, predictions, or weights are committed; `*.xlsx`, `*.pth` and the T5 checkpoints are git-ignored).
 
 ## Pipeline
 
 | Step | File | What it does |
 |------|------|--------------|
 | 1. Preprocess | `Project/Data Preprocess.ipynb` | Flattens the jsonl files into one row per instruction step; asks GPT-4o for colour-free and for simplified versions of each drawing's instructions; builds per-cell rows (`row_number`, `column_number`, `action_label`) with the instruction history of the drawing as input; writes `expanded_df_final.xlsx`. |
-| 2. T5 | `Project/T5_Training.py`, `Project/inference.py` | Fine-tunes `google/t5-v1_1-base` on the Excel table (AdamW, lr 3e-5, default 50 epochs, keeps the best-dev-loss checkpoint). Inference writes a `simplified_instructions` column. |
-| 3. Action classifiers | `classificationbased.py`, `classificationbased_nocolor.py`, `classificationbased-abstraction.py`, `classification_evaluation.py` | Fine-tune `microsoft/mdeberta-v3-base` (20 epochs, Adam, lr 3e-5, batch 25) to predict, for a given cell, the colour label painted at this step (8 classes), a coloured / not-coloured flag (2 classes, no colour words), or the same with the abstraction level in the input. The evaluation script reloads `model.pth` and writes predictions for all rows to `predictiondf.xlsx`. |
-| 4. Abstraction level | `deberta_abs.py`, `lstm_abs.py` | Classify an instruction into 4 abstraction groups (simple; symmetry/other; composed objects/conditions/none; iteration/recursion) with mDeBERTa and with a 2-layer BiLSTM. Print accuracy and macro-F1 per split. |
+| 2. T5 | `Project/prepare_t5_data.py`, `Project/T5_Training.py`, `Project/inference.py` | Task: **instruction simplification** (decision below). `prepare_t5_data.py` builds `t5_instr`, `t5_target`, `t5_instr_no_color`, `t5_target_no_color`; `T5_Training.py` fine-tunes `google/t5-v1_1-base` on them (AdamW, lr 3e-5, default 50 epochs, keeps the best-dev-loss checkpoint, evaluates that checkpoint once on the test split); `inference.py` writes a `simplified_instructions` column. All three build the input with `hexagons_common.build_t5_input`. |
+| 3. Action classifiers | `classificationbased.py`, `classificationbased_nocolor.py`, `classificationbased-abstraction.py`, `classification_evaluation.py` | Fine-tune `microsoft/mdeberta-v3-base` (20 epochs, Adam, lr 3e-5, batch 25) to predict, for a given cell, the colour label painted at this step (8 classes), a coloured / not-coloured flag (2 classes, no colour words), or the same with the abstraction level in the input. `classification_evaluation.py` reloads the weights, predicts the requested splits (default dev and test), writes `predictiondf.xlsx`, and prints and saves accuracy and macro-F1 per split next to the majority-class baseline (`metrics_<variant>.json`). |
+| 4. Abstraction level | `deberta_abs.py`, `lstm_abs.py` | Classify an instruction into 4 abstraction groups (simple; symmetry/other; composed objects/conditions/none; iteration/recursion) with mDeBERTa and with a 2-layer BiLSTM. Print accuracy and macro-F1 per split, with the majority-class baseline. The BiLSTM packs padded sequences, so padding does not change its output. |
 
-All scripts are in `Project/` and read their Excel inputs from the current directory.
+All scripts are in `Project/`; shared helpers (seed, T5 prompt, GPT merge, metrics, class weights) are in `Project/hexagons_common.py`. Excel inputs and outputs default to the old file names, in the current directory, and can be changed with `--input_file` / `--output_file` / `--model_path`.
+
+### T5 task decision
+
+The code decodes to `simplified_instructions`, the notebook's GPT-4o step produces simplified instructions, and the paper's setting is grounding abstract instructions; the earlier training target (the 180-cell board state as text) matched none of that. This repository therefore treats T5 as **instruction simplification**: input `simplify instructions: <one instruction>`, target the GPT-4o simplified rewrite of that step. The `no_color` variant takes the GPT-4o colour-free instruction as input and the simplified target with colour words removed by a fixed word list (`strip_colors`, not GPT). Board-state prediction is not trained any more. TODO(sarp): confirm this is the task your report intends.
 
 ## Tech stack
 
-Python, PyTorch, Hugging Face Transformers, pandas, scikit-learn, OpenAI API (notebook only).
+Python, PyTorch, Hugging Face Transformers, pandas, scikit-learn, pytest (tests), OpenAI API (notebook only).
 
 ## Quickstart
 
@@ -45,47 +68,51 @@ pip install -r requirements.txt
 
 `requirements.txt` uses lower bounds set to the versions installed and checked in a Python 3.12 venv. To run the notebook, also install `jupyter` (or `ipykernel`); it is not in `requirements.txt`.
 
-What was and was not run for this README:
+Tests (CPU, tiny synthetic data, no downloads, no network):
 
-- Run: `py_compile` and `pyflakes` on all 8 scripts; importing every dependency; the notebook's cells that reload `df_no_color.xlsx` and build the per-cell rows, on a tiny synthetic dataframe (round trip of `resulting_labels`); the DataLoader ordering used by `classification_evaluation.py`, on a toy dataset.
-- Only compiled, never executed: `T5_Training.py`, `inference.py`, the three `classificationbased*.py`, `classification_evaluation.py`, `lstm_abs.py`, and `deberta_abs.py`. In particular `deberta_abs.py` has never been run end to end by anyone in this review, so more bugs may remain. The notebook's OpenAI cells were not run.
+```bash
+pip install pytest
+python -m pytest tests -q
+```
 
-The commands below are the authors' usage, not re-verified:
+What was and was not run:
+
+- Run: the tests above, `py_compile` and `pyflakes` on every script, and the BiLSTM abstraction classifier on the real Hexagons data on CPU (see Results). A one-step `t5-small` smoke run of `prepare_t5_data.py` and `T5_Training.py` is described under Results.
+- Never run on real data: the three `classificationbased*.py` scripts, `classification_evaluation.py`, `deberta_abs.py` (mDeBERTa on CPU is too slow here), and `inference.py`. Their training / prediction code is exercised only through a tiny randomly initialised DeBERTa in the tests. The notebook's OpenAI cells were not run.
+
+Usage:
 
 ```bash
 cd Project
-# 1. run Data Preprocess.ipynb (needs the Hexagons data and your own OpenAI key in the client setup cell)
-python T5_Training.py --data_file path/to/dataset.xlsx --include_abstraction_level --epochs 50   # or --no_color instead; with --no_color the abstraction flag is ignored
-python inference.py --device cuda --model_path path/to/model --batch_size 100 --show_time_remaining --input_file in.xlsx --output_file out.xlsx
-python classificationbased.py          # also classificationbased_nocolor.py, classificationbased-abstraction.py
-python classification_evaluation.py
-python deberta_abs.py
-python lstm_abs.py
+# 1. run Data Preprocess.ipynb (needs the Hexagons data and `export OPENAI_API_KEY=...`); it writes df_no_color.xlsx and expanded_df_final.xlsx
+python prepare_t5_data.py --input_file df_no_color.xlsx --output_file t5_data.xlsx
+python T5_Training.py --data_file t5_data.xlsx --include_abstraction_level --epochs 50 --seed 42   # or --no_color; with --no_color the abstraction flag is ignored
+python inference.py --device cuda --model_path path/to/model --batch_size 100 --show_time_remaining --input_file in.xlsx --output_file out.xlsx   # add --include_abstraction_level if trained with it
+python classificationbased.py --seed 42 [--class_weighted]   # also classificationbased_nocolor.py, classificationbased-abstraction.py
+python classification_evaluation.py --variant color   # or nocolor / abstraction
+python deberta_abs.py --seed 42 [--class_weighted]
+python lstm_abs.py --seed 42 [--class_weighted]
 ```
 
-T5 arguments: `--data_file` (required), `--include_abstraction_level`, `--no_color`, `--epochs` (default 50). Inference arguments: `--device`, `--model_path`, `--batch_size`, `--show_time_remaining`, `--input_file`, `--output_file`.
+T5 arguments: `--data_file` (required), `--include_abstraction_level`, `--no_color`, `--epochs` (default 50), `--model_name`, `--batch_size`, `--max_length`, `--max_batches` (smoke tests), `--seed`. Inference arguments: `--device`, `--model_path`, `--batch_size`, `--show_time_remaining`, `--instruction_column`, `--include_abstraction_level`, `--input_file`, `--output_file`.
+
+Class imbalance: most per-cell labels are 0, so accuracy alone misleads. `--class_weighted` (classification and abstraction scripts) uses an inverse-frequency weighted loss, off by default to keep the original behaviour; evaluation always prints macro-F1 and the majority-class baseline.
 
 ## Reproducibility notes
 
-- No random seeds are set anywhere; runs are not deterministic.
-- The OpenAI calls use `gpt-4o` and the notebook's API key is a placeholder (`MY_API_KEY`); GPT outputs were saved as pickles that are not committed, and several drawings were repaired by hand in the notebook (the cell that builds `new_instructions_clean`).
+- Every script has `--seed` (default 42), which seeds python, numpy and torch and the training loader's shuffle. Runs on GPU can still differ because some CUDA kernels are non-deterministic.
+- The OpenAI calls use `gpt-4o` and the notebook reads the key from the environment variable `OPENAI_API_KEY` (never store it in a file); GPT outputs were saved as pickles that are not committed, and several drawings were repaired by hand in the notebook (the cell that builds `new_instructions_clean`). The simplified output is merged by `merge_simplified`, which only accepts a drawing whose step count matches; mismatched drawings are listed and left empty (and dropped by `prepare_t5_data.py`), not repaired.
 - Intermediate files (`df_no_color.xlsx`, `expanded_df_final.xlsx`, `model*.pth`) are not in the repo and are git-ignored. The notebook writes `df_no_color.xlsx` (and reads it back, converting `resulting_labels` from a string to a list) only since the fix in this version.
 
 ## Limitations
 
-- Course project, not a maintained library. No tests, no CI, no committed results or logs.
-- T5 data prep is missing: `T5_Training.py` expects columns (`t5_instr`, `resulting_label_list`, `t5_instr_no_color`, `resulting_label_list_no_color`) that the notebook never creates.
-- The T5 training target is a board state (label list), while `inference.py` decodes to a column named `simplified_instructions`, and its prompt (`simplify instructions: ...`) does not match the training input format. The README's "T5 for simplification" is not what the training code does.
-- The notebook asks GPT-4o for simplified instructions but never merges them into the dataframe.
-- `T5_Training.py` builds a test loader and never evaluates on it.
-- The three `classificationbased*.py` scripts save with `model.module.state_dict()`, which fails unless `DataParallel` is active (more than one GPU).
-- No random seeds are set; runs are not deterministic.
-- Excel input and output names are hard-coded (for example `expanded_df_final.xlsx`) with no CLI option, except in the T5 scripts.
-- No class weighting: most per-cell labels are 0, so accuracy is misleading for the action classifiers; no per-class metrics are computed.
-- The BiLSTM uses the last hidden state over 512-token padded input without masking.
-- The classifier input carries no board state, only the cell position and the instruction history.
-- `classification_evaluation.py` predicts over all splits (train, dev and test) and computes no metric.
-- Fixed in this version, but not run on real data: `classification_evaluation.py` shuffled its loader while assigning predictions by position (now `shuffle=False`); T5 labels now mask padding with -100; `deberta_abs.py` moves the model to the device and uses 4 classes (also the BiLSTM); BiLSTM F1 is computed over the whole epoch; undefined names in `deberta_abs.py`.
+- Course project, not a maintained library. CI is not set up; tests are run locally only.
+- The T5 task was changed to instruction simplification (see above). It has not been trained on the real GPT-4o targets here, so there is no T5 result. The GPT-4o simplified text is unreviewed, and drawings whose GPT output has the wrong step count are dropped, not repaired.
+- The no-colour T5 target is made by a fixed colour-word list, so it leaves colour-implying phrases (for example "the colour of the sky") and strips colour words used in any sense.
+- The classifier input carries no board state, only the cell position and the instruction history. This is a design weakness and was not changed.
+- Class weighting is optional and off by default; per-class metrics (beyond macro-F1) are not reported.
+- Changed behaviour in this version (not validated against the authors' earlier runs): the BiLSTM output now ignores padding; `classification_evaluation.py` predicts dev and test only unless `--splits` says otherwise; the T5 target and prompt changed; `T5_Training.py` loads the model inside `main` and evaluates the best checkpoint on the test split.
+- Earlier fixes, also not run on real data: `classification_evaluation.py` no longer shuffles its loader; T5 labels mask padding with -100; `deberta_abs.py` moves the model to the device and uses 4 classes (also the BiLSTM); BiLSTM F1 is computed over the whole epoch.
 
 ## Credits and license
 
