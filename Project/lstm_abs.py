@@ -83,7 +83,7 @@ class BiLSTM(nn.Module):
 
 
 # Initialize model
-model = BiLSTM(vocab_size=tokenizer.vocab_size, embedding_dim=256, hidden_dim=128, output_dim=5, num_layers=2, bidirectional=True, dropout=0.5)
+model = BiLSTM(vocab_size=tokenizer.vocab_size, embedding_dim=256, hidden_dim=128, output_dim=4, num_layers=2, bidirectional=True, dropout=0.5)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 model.train()
@@ -93,10 +93,10 @@ loss_fn = nn.CrossEntropyLoss()
 
 model_save_path = "lstm_model"
 
-def calculate_metrics(predictions, labels):
-    _, preds = torch.max(predictions, 1)
-    accuracy = accuracy_score(labels.cpu(), preds.cpu())
-    f1 = f1_score(labels.cpu(), preds.cpu(), average='macro')
+def calculate_metrics(all_preds, all_labels):
+    # Computed once per epoch over every prediction, not averaged per batch.
+    accuracy = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average='macro')
     return accuracy, f1
 
 
@@ -104,8 +104,7 @@ def calculate_metrics(predictions, labels):
 for epoch in range(20):
     model.train()
     total_train_loss = 0
-    train_accuracies = []
-    train_f1_scores = []
+    train_preds, train_labels = [], []
 
     for batch in train_loader:
         # Move batch data to the device
@@ -119,19 +118,16 @@ for epoch in range(20):
         optimizer.step()
 
         total_train_loss += loss.item()
-        accuracy, f1 = calculate_metrics(predictions, labels)
-        train_accuracies.append(accuracy)
-        train_f1_scores.append(f1)
+        train_preds.extend(predictions.argmax(dim=1).cpu().tolist())
+        train_labels.extend(labels.cpu().tolist())
 
-    avg_train_accuracy = sum(train_accuracies) / len(train_accuracies)
-    avg_train_f1 = sum(train_f1_scores) / len(train_f1_scores)
+    avg_train_accuracy, avg_train_f1 = calculate_metrics(train_preds, train_labels)
     print(f'Epoch {epoch+1}, Training Loss: {total_train_loss:.4f}, Accuracy: {avg_train_accuracy:.4f}, F1 Score: {avg_train_f1:.4f}')
 
     # Validation after each epoch
     model.eval()
     total_val_loss = 0
-    val_accuracies = []
-    val_f1_scores = []
+    val_preds, val_labels = [], []
 
     with torch.no_grad():
         for batch in dev_loader:
@@ -142,12 +138,10 @@ for epoch in range(20):
             predictions = model(input_ids)
             loss = loss_fn(predictions, labels)
             total_val_loss += loss.item()
-            accuracy, f1 = calculate_metrics(predictions, labels)
-            val_accuracies.append(accuracy)
-            val_f1_scores.append(f1)
+            val_preds.extend(predictions.argmax(dim=1).cpu().tolist())
+            val_labels.extend(labels.cpu().tolist())
 
-    avg_val_accuracy = sum(val_accuracies) / len(val_accuracies)
-    avg_val_f1 = sum(val_f1_scores) / len(val_f1_scores)
+    avg_val_accuracy, avg_val_f1 = calculate_metrics(val_preds, val_labels)
     print(f'Validation Loss: {total_val_loss:.4f}, Accuracy: {avg_val_accuracy:.4f}, F1 Score: {avg_val_f1:.4f}')
 
 torch.save(model.state_dict(), f"{model_save_path}.pth")

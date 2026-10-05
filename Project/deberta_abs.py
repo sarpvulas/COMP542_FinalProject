@@ -3,7 +3,9 @@ from torch.utils.data import DataLoader, Dataset
 from torch.optim import AdamW, Adam
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from transformers import get_scheduler
+import numpy as np
 import pandas as pd
+from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 from torch.optim import Adam
 from torch.nn import CrossEntropyLoss
@@ -59,11 +61,11 @@ class TextDataset(Dataset):
 model_id = "microsoft/mdeberta-v3-base"
 
 tokenizer = AutoTokenizer.from_pretrained(model_id)
-model = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=5)
+model = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=4)
 
 # Create dataset objects
 train_dataset = TextDataset(train_df, tokenizer)
-valid_dataset = TextDataset(valid_df, tokenizer)
+valid_dataset = TextDataset(dev_df, tokenizer)
 
 # Create dataloaders
 train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
@@ -75,6 +77,7 @@ loss_fn = CrossEntropyLoss()
 # Setup device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using {device} for training")
+model.to(device)
 
 model_save_path = "deberta_abstraction"
 
