@@ -1,4 +1,9 @@
-pandas==1.3.5
-torch==1.10.0
-transformers==4.12.3
-openpyxl==3.0.9
+numpy
+pandas
+torch
+transformers
+sentencepiece
+scikit-learn
+openpyxl
+tqdm
+openai
