@@ -43,12 +43,19 @@ Python, PyTorch, Hugging Face Transformers, pandas, scikit-learn, OpenAI API (no
 pip install -r requirements.txt
 ```
 
-`requirements.txt` is unpinned; the imports and syntax of all scripts were checked on Python 3.12 with current releases (torch 2.14, transformers 5.18, pandas 3.0). Training was not run for this README (no dataset, no GPU, and models are large downloads), so the commands below are the authors' usage, not re-verified:
+`requirements.txt` uses lower bounds set to the versions installed and checked in a Python 3.12 venv. To run the notebook, also install `jupyter` (or `ipykernel`); it is not in `requirements.txt`.
+
+What was and was not run for this README:
+
+- Run: `py_compile` and `pyflakes` on all 8 scripts; importing every dependency; the notebook's cells that reload `df_no_color.xlsx` and build the per-cell rows, on a tiny synthetic dataframe (round trip of `resulting_labels`); the DataLoader ordering used by `classification_evaluation.py`, on a toy dataset.
+- Only compiled, never executed: `T5_Training.py`, `inference.py`, the three `classificationbased*.py`, `classification_evaluation.py`, `lstm_abs.py`, and `deberta_abs.py`. In particular `deberta_abs.py` has never been run end to end by anyone in this review, so more bugs may remain. The notebook's OpenAI cells were not run.
+
+The commands below are the authors' usage, not re-verified:
 
 ```bash
 cd Project
 # 1. run Data Preprocess.ipynb (needs the Hexagons data and your own OpenAI key in the client setup cell)
-python T5_Training.py --data_file path/to/dataset.xlsx --include_abstraction_level --no_color --epochs 50
+python T5_Training.py --data_file path/to/dataset.xlsx --include_abstraction_level --epochs 50   # or --no_color instead; with --no_color the abstraction flag is ignored
 python inference.py --device cuda --model_path path/to/model --batch_size 100 --show_time_remaining --input_file in.xlsx --output_file out.xlsx
 python classificationbased.py          # also classificationbased_nocolor.py, classificationbased-abstraction.py
 python classification_evaluation.py
@@ -61,18 +68,24 @@ T5 arguments: `--data_file` (required), `--include_abstraction_level`, `--no_col
 ## Reproducibility notes
 
 - No random seeds are set anywhere; runs are not deterministic.
-- The OpenAI calls use `gpt-4o` and the notebook's API key is a placeholder (`MY_API_KEY`); GPT outputs were saved as pickles that are not committed, and several drawings were repaired by hand in the notebook (cell "new_instructions_clean").
-- Intermediate files (`df_no_color.xlsx`, `expanded_df_final.xlsx`, `model*.pth`) are not in the repo and are git-ignored.
+- The OpenAI calls use `gpt-4o` and the notebook's API key is a placeholder (`MY_API_KEY`); GPT outputs were saved as pickles that are not committed, and several drawings were repaired by hand in the notebook (the cell that builds `new_instructions_clean`).
+- Intermediate files (`df_no_color.xlsx`, `expanded_df_final.xlsx`, `model*.pth`) are not in the repo and are git-ignored. The notebook writes `df_no_color.xlsx` (and reads it back, converting `resulting_labels` from a string to a list) only since the fix in this version.
 
 ## Limitations
 
 - Course project, not a maintained library. No tests, no CI, no committed results or logs.
-- The T5 scripts expect columns (`t5_instr`, `resulting_label_list`, `t5_instr_no_color`, `resulting_label_list_no_color`) that the notebook never creates, and `inference.py` prompts with `simplify instructions: ...` while training uses a different input format. The T5 data-prep step is therefore missing from the repo.
-- The notebook creates the simplified instructions with GPT-4o but never merges them into the dataframe.
-- `T5_Training.py` builds the test loader but never evaluates on it. The classifier scripts train on the train split and report only losses; `classification_evaluation.py` predicts over all splits and computes no metric.
-- The three `classificationbased*.py` scripts save with `model.module.state_dict()`, which only works when `DataParallel` is active (more than one GPU); on one GPU or CPU they fail at the end of the first epoch.
-- Input paths are relative file names (for example `expanded_df_final.xlsx`) with no CLI option, except in the T5 scripts.
-- `deberta_abs.py` had undefined names (`valid_df`, `np`, metric imports); fixed in this version but not run.
+- T5 data prep is missing: `T5_Training.py` expects columns (`t5_instr`, `resulting_label_list`, `t5_instr_no_color`, `resulting_label_list_no_color`) that the notebook never creates.
+- The T5 training target is a board state (label list), while `inference.py` decodes to a column named `simplified_instructions`, and its prompt (`simplify instructions: ...`) does not match the training input format. The README's "T5 for simplification" is not what the training code does.
+- The notebook asks GPT-4o for simplified instructions but never merges them into the dataframe.
+- `T5_Training.py` builds a test loader and never evaluates on it.
+- The three `classificationbased*.py` scripts save with `model.module.state_dict()`, which fails unless `DataParallel` is active (more than one GPU).
+- No random seeds are set; runs are not deterministic.
+- Excel input and output names are hard-coded (for example `expanded_df_final.xlsx`) with no CLI option, except in the T5 scripts.
+- No class weighting: most per-cell labels are 0, so accuracy is misleading for the action classifiers; no per-class metrics are computed.
+- The BiLSTM uses the last hidden state over 512-token padded input without masking.
+- The classifier input carries no board state, only the cell position and the instruction history.
+- `classification_evaluation.py` predicts over all splits (train, dev and test) and computes no metric.
+- Fixed in this version, but not run on real data: `classification_evaluation.py` shuffled its loader while assigning predictions by position (now `shuffle=False`); T5 labels now mask padding with -100; `deberta_abs.py` moves the model to the device and uses 4 classes (also the BiLSTM); BiLSTM F1 is computed over the whole epoch; undefined names in `deberta_abs.py`.
 
 ## Credits and license
 
