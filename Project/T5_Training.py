@@ -6,8 +6,9 @@ from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 import time
 import argparse
+import warnings
 
-from hexagons_common import add_seed_arg, model_input, set_seed
+from hexagons_common import add_seed_arg, model_input, set_seed, set_truncation_side
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -79,6 +80,7 @@ class HexagonsDataset(Dataset):
             label = str(item['resulting_label_list'])
             instruction = model_input(instruction, item['abstraction_level'], self.include_abstraction_level)
 
+        set_truncation_side(self.tokenizer, 'left')  # keep the current (last) instruction of a long history
         input_encoding = self.tokenizer(
             instruction,
             padding='max_length',
@@ -87,6 +89,7 @@ class HexagonsDataset(Dataset):
             return_tensors="pt"
         )
 
+        set_truncation_side(self.tokenizer, 'right')
         label_encoding = self.tokenizer(
             label,
             padding='max_length',
@@ -103,6 +106,18 @@ class HexagonsDataset(Dataset):
             'attention_mask': input_encoding['attention_mask'].squeeze(0),
             'labels': labels
         }
+
+
+def check_target_length(tokenizer, targets, max_length):
+    """Warn when `max_length` is smaller than the longest target (it would be cut silently).
+
+    Returns the longest target length in tokens (with the end-of-sequence token).
+    """
+    longest = max(len(ids) for ids in tokenizer(list(targets), truncation=False)['input_ids'])
+    if max_length < longest:
+        warnings.warn(f"--max_length {max_length} is smaller than the longest board target "
+                      f"({longest} tokens): targets will be truncated", stacklevel=2)
+    return longest
 
 
 def create_dataloader(file_path, dataset_type, tokenizer, batch_size=4, include_abstraction_level=False,
@@ -179,6 +194,11 @@ def main(args):
     tokenizer = T5Tokenizer.from_pretrained(args.model_name)
     model = T5ForConditionalGeneration.from_pretrained(args.model_name).to(device)
     print(device)
+
+    target_column = 'resulting_label_list_no_color' if args.no_color else 'resulting_label_list'
+    all_targets = pd.read_excel(args.data_file, index_col=0)[target_column].astype(str)
+    longest = check_target_length(tokenizer, all_targets, args.max_length)
+    print(f"Longest board target: {longest} tokens (max_length {args.max_length})")
 
     common = dict(include_abstraction_level=args.include_abstraction_level, no_color=args.no_color,
                   batch_size=args.batch_size, max_length=args.max_length)
