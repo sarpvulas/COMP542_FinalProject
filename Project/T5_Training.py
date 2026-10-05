@@ -7,7 +7,7 @@ from transformers import get_linear_schedule_with_warmup
 import time
 import argparse
 
-from hexagons_common import add_seed_arg, set_seed, with_abstraction_level
+from hexagons_common import add_seed_arg, model_input, set_seed
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -46,9 +46,9 @@ class HexagonsDataset(Dataset):
         """
         df = pd.read_excel(data_file, index_col=0)
         if no_color:
-            dataset = df[df['dataset'] == dataset_type][['t5_instr_no_color', 't5_target_no_color']]
+            dataset = df[df['dataset'] == dataset_type][['t5_instr_no_color', 'resulting_label_list_no_color']]
         else:
-            dataset = df[df['dataset'] == dataset_type][['t5_instr', 't5_target', 'abstraction_level']]
+            dataset = df[df['dataset'] == dataset_type][['t5_instr', 'resulting_label_list', 'abstraction_level']]
         return dataset.reset_index(drop=True)
 
     def __len__(self):
@@ -73,12 +73,11 @@ class HexagonsDataset(Dataset):
         item = self.data.iloc[idx]
         if self.no_color:
             instruction = str(item['t5_instr_no_color'])
-            label = str(item['t5_target_no_color'])
+            label = str(item['resulting_label_list_no_color'])
         else:
             instruction = str(item['t5_instr'])
-            label = str(item['t5_target'])
-            if self.include_abstraction_level:
-                instruction = with_abstraction_level(instruction, item['abstraction_level'])
+            label = str(item['resulting_label_list'])
+            instruction = model_input(instruction, item['abstraction_level'], self.include_abstraction_level)
 
         input_encoding = self.tokenizer(
             instruction,

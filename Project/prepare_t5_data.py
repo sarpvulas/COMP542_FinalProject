@@ -1,43 +1,67 @@
-"""Build the T5 training table for the instruction-simplification task.
+"""Build the T5 training table for board prediction (the paper's instruction-to-execution task).
 
-Task (decision, see README): input = one drawing instruction, target = its simplified,
-standalone rewrite produced by GPT-4o in the preprocessing notebook.
+Task: from the instructions of a drawing up to step t, T5 writes the board after step t.
 
 Input : an Excel file with one row per instruction step and the columns `dataset`,
-        `id_of_drawing`, `step_number`, `abstraction_level`, `instructions`, `no_color`
-        and `simplified_instructions` (the notebook writes it as `df_no_color.xlsx`
-        after merging the GPT-4o output with `merge_simplified`).
-Output: the same rows plus four columns read by `T5_Training.py`:
+        `id_of_drawing`, `step_number`, `abstraction_level`, `instructions`,
+        `resulting_labels` (the 180 board labels, stored by Excel as the string "[0, 1, ...]"),
+        and optionally `no_color` (the GPT-4o colour-free instruction from the notebook).
+        `make_abstraction_xlsx.py` writes such a file without GPT (no `no_color` column);
+        the notebook's `df_no_color.xlsx` has all columns.
+Output: the same rows plus the columns read by `T5_Training.py` and `inference.py`:
 
-  t5_instr               T5_PROMPT_PREFIX + instructions
-  t5_target              simplified_instructions
-  t5_instr_no_color      T5_PROMPT_PREFIX + no_color (GPT-4o colour-free instruction)
-  t5_target_no_color     simplified_instructions with colour words removed
-                         (hexagons_common.strip_colors, a fixed word list, not GPT)
+  t5_instr                       T5_PROMPT_PREFIX + the drawing's instructions up to this step,
+                                 joined with " [SEP]" (the same history the classifiers use)
+  resulting_label_list           the board after this step as text (board_text.render_board)
+  t5_instr_no_color              as t5_instr, from the `no_color` instructions (only if that column exists)
+  resulting_label_list_no_color  the board with every paint colour collapsed to 1 (board_text.collapse_board)
 
-Rows with a missing instruction, no-colour instruction or simplified target are dropped.
+Assumption, stated plainly: the original T5 code never fed a board into the model (only
+`t5_instr` and, optionally, the abstraction level), so the previous board is not part of the
+input; the instruction history carries it, as for the classifiers.
 """
 import argparse
+import ast
 
 import pandas as pd
 
-from hexagons_common import build_t5_input, strip_colors
+from board_text import collapse_board, render_board
+from hexagons_common import build_t5_input
 
-REQUIRED = ["dataset", "id_of_drawing", "step_number", "abstraction_level",
-            "instructions", "no_color", "simplified_instructions"]
-NEW_COLUMNS = ["t5_instr", "t5_target", "t5_instr_no_color", "t5_target_no_color"]
+REQUIRED = ["dataset", "id_of_drawing", "step_number", "abstraction_level", "instructions", "resulting_labels"]
+HISTORY_SEP = " [SEP] "
+NEW_COLUMNS = ["t5_instr", "resulting_label_list", "t5_instr_no_color", "resulting_label_list_no_color"]
+
+
+def _labels(value):
+    return ast.literal_eval(value) if isinstance(value, str) else list(value)
+
+
+def _history(df, column):
+    """For every row, the `column` texts of its drawing up to and including its step, joined."""
+    out = pd.Series(index=df.index, dtype="object")
+    for _, group in df.groupby("id_of_drawing", sort=False):
+        ordered = group.sort_values("step_number")
+        texts = ordered[column].astype(str).tolist()
+        for i, idx in enumerate(ordered.index):
+            out.loc[idx] = HISTORY_SEP.join(texts[: i + 1])
+    return out
 
 
 def build_t5_table(df):
     missing = [c for c in REQUIRED if c not in df.columns]
     if missing:
         raise ValueError(f"input is missing columns: {missing}")
-    out = df.dropna(subset=["instructions", "no_color", "simplified_instructions"]).copy()
-    out = out[out["simplified_instructions"].astype(str).str.strip() != ""]
-    out["t5_instr"] = out["instructions"].astype(str).map(build_t5_input)
-    out["t5_target"] = out["simplified_instructions"].astype(str)
-    out["t5_instr_no_color"] = out["no_color"].astype(str).map(build_t5_input)
-    out["t5_target_no_color"] = out["simplified_instructions"].astype(str).map(strip_colors)
+    if not df.index.is_unique:
+        raise ValueError("input needs a unique index")
+    out = df.dropna(subset=["instructions"]).copy()  # 1 row in Hexagons has no instruction
+    out["t5_instr"] = _history(out, "instructions").map(build_t5_input)
+    boards = out["resulting_labels"].map(_labels)
+    out["resulting_label_list"] = boards.map(render_board)
+    out["resulting_label_list_no_color"] = boards.map(lambda b: render_board(collapse_board(b)))
+    if "no_color" in out.columns:
+        out = out.dropna(subset=["no_color"]).copy()
+        out["t5_instr_no_color"] = _history(out, "no_color").map(build_t5_input)
     return out.reset_index(drop=True)
 
 
@@ -51,6 +75,8 @@ def main():
     out.to_excel(args.output_file)
     print(f"{len(df)} rows in, {len(out)} rows out -> {args.output_file}")
     print(out["dataset"].value_counts().to_string())
+    if "t5_instr_no_color" not in out.columns:
+        print("no `no_color` column: t5_instr_no_color not written (T5_Training --no_color needs it)")
 
 
 if __name__ == "__main__":
