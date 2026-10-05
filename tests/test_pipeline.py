@@ -92,8 +92,51 @@ def test_prepare_requires_columns():
         p5.build_t5_table(raw_df())
 
 
-def test_strip_colors_keeps_other_words():
-    assert hc.strip_colors("Color it Red, then the redo column blue.") == "Color it , then the redo column ."
+@pytest.mark.parametrize("text,expected", [
+    ("Make a green and yellow flower", "Make a flower"),
+    ("Color white hexagons black", "Color white hexagons"),
+    ("Paint the hexagon Red-orange", "Paint the hexagon"),
+    ("Fill in red; then blue", "Fill in"),
+    ("Make it Navy", "Make it"),
+    ("Use red, blue and green here.", "Use here."),
+    ("Make the hexagon green instead of red", "Make the hexagon instead of"),  # known ungrammatical case
+    ("colour of the sky", "colour of the sky"),
+    ("Redo the redwood row", "Redo the redwood row"),
+])
+def test_strip_colors_examples(text, expected):
+    assert hc.strip_colors(text) == expected
+
+
+def test_merge_rejects_duplicates_and_strips_numbering():
+    df = raw_df()
+    dup_index = pd.concat([df, df.iloc[:1]])
+    with pytest.raises(ValueError, match="unique"):
+        hc.merge_simplified(dup_index, {})
+    dup_step = pd.concat([df, df.iloc[:1]], ignore_index=True)
+    with pytest.raises(ValueError, match="step_number"):
+        hc.merge_simplified(dup_step, {})
+    out, bad = hc.merge_simplified(df, {1: SEP.join(["1. a", "2) b"]), 2: ["Step 1. x", "y 3. z", "3.5 cells"]})
+    assert bad == []
+    assert out["simplified_instructions"].tolist() == ["a", "b", "x", "y 3. z", "3.5 cells"]
+
+
+def test_make_abstraction_xlsx_from_tiny_jsonl(tmp_path):
+    import json
+    import make_abstraction_xlsx as mk
+    board = [0] * 180
+    (tmp_path / "data").mkdir()
+    for split, cat in [("train", "simple"), ("dev", None), ("test", "recursion")]:
+        entry = {"index": 7, "drawing_procedure": [[0, "NONE", board], [1, "paint a", board], [2, "paint b", board]]}
+        if cat:
+            entry["category"] = cat
+        (tmp_path / "data" / f"{split}.jsonl").write_text(json.dumps(entry) + "\n")
+    df = mk.build_dataframe(tmp_path)
+    assert len(df) == 6 and set(df.dataset) == {"train", "dev", "test"}
+    assert df.loc[df.dataset == "dev", "abstraction_level"].tolist() == ["NONE", "NONE"]
+    out = tmp_path / "df.xlsx"
+    df.to_excel(out)
+    loaded = hc.load_abstraction_df(out)  # the loader used by lstm_abs.py
+    assert loaded["abstraction_label"].tolist() == [0, 0, 2, 2, 3, 3]
 
 
 def test_inference_uses_shared_prompt():

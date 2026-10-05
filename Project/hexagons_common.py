@@ -31,8 +31,27 @@ _STEP_SPLIT = re.compile(r"\s*" + re.escape(STEP_MARKER) + r"\s*")
 
 # Digits 0..7 of the board state are white, black, yellow, green, red, blue, purple, orange
 # (Hexagons README). White is the empty cell, so it is not stripped as a "colour word".
-COLOR_WORDS = ("black", "yellow", "green", "red", "blue", "purple", "orange")
-_COLOR_RE = re.compile(r"\b(?:" + "|".join(COLOR_WORDS) + r")\b\s*", re.IGNORECASE)
+# The seven paint colours plus common synonyms found in free-text instructions. "white" is the
+# empty cell and is kept on purpose ("color white hexagons black" -> "color white hexagons").
+COLOR_WORDS = ("black", "yellow", "green", "red", "blue", "purple", "orange", "pink", "brown",
+               "gray", "grey", "navy", "violet", "cyan", "magenta", "teal", "turquoise", "maroon",
+               "gold", "golden", "lime", "indigo", "lavender", "beige")
+_COLOR = r"(?:" + "|".join(COLOR_WORDS) + r")"
+# A colour, hyphenated compounds ("red-orange"), and lists of colours joined by commas / and / or / & / slash.
+_COLOR_TERM = _COLOR + r"(?:-" + _COLOR + r")*"
+_COLOR_RUN_RE = re.compile(
+    r"(?<!\w)" + _COLOR_TERM + r"(?:\s*(?:,|/|&)\s*(?:(?:and|or)\s+)?|\s+(?:and|or)\s+)(?=" + _COLOR_TERM + r")",
+    re.IGNORECASE)
+_COLOR_RE = re.compile(r"(?<!\w)" + _COLOR_TERM + r"(?!\w)", re.IGNORECASE)
+_FILLER_SEGMENTS = {"", "then", "and", "or", "but", "also"}
+
+
+_NUMBERING = re.compile(r"^\s*(?:step\s+)?\d+\s*[.)]\s+", re.IGNORECASE)
+
+
+def _strip_numbering(step):
+    """Drop a leading "1. " / "2) " / "Step 3. " (the GPT prompt forbids numbering but models add it)."""
+    return _NUMBERING.sub("", str(step), count=1).strip()
 
 
 def split_steps(text):
@@ -49,6 +68,10 @@ def merge_simplified(df, simplified_by_drawing):
     id is returned in the second value, so nothing is silently misaligned.
     Rows are matched by order of `step_number` within a drawing.
     """
+    if not df.index.is_unique:
+        raise ValueError("merge_simplified needs a unique DataFrame index")
+    if df.duplicated(["id_of_drawing", "step_number"]).any():
+        raise ValueError("duplicated (id_of_drawing, step_number) pairs; steps cannot be matched by order")
     out = df.copy()
     out["simplified_instructions"] = pd.Series([None] * len(out), index=out.index, dtype="object")
     mismatched = []
@@ -57,7 +80,7 @@ def merge_simplified(df, simplified_by_drawing):
         if raw is None:
             mismatched.append(drawing_id)
             continue
-        steps = list(raw) if isinstance(raw, (list, tuple)) else split_steps(raw)
+        steps = [_strip_numbering(x) for x in (raw if isinstance(raw, (list, tuple)) else split_steps(raw))]
         ordered = group.sort_values("step_number")
         if len(steps) != len(ordered):
             mismatched.append(drawing_id)
@@ -67,8 +90,27 @@ def merge_simplified(df, simplified_by_drawing):
 
 
 def strip_colors(text):
-    """Remove colour words (see COLOR_WORDS) from a string; used for the no-colour T5 target."""
-    return re.sub(r"\s{2,}", " ", _COLOR_RE.sub("", str(text))).strip()
+    """Remove colour words (see COLOR_WORDS) from a string; used for the no-colour T5 target.
+
+    Colour lists ("green and yellow"), hyphenated compounds ("Red-orange") and capitalised
+    colours are removed whole; clauses left empty or holding only "then/and/or/but/also" are dropped.
+    The rule is not grammatical in general (see README): "instead of red" leaves "instead of".
+    Text without a colour word is returned unchanged (apart from outer whitespace).
+    """
+    text = str(text)
+    if not _COLOR_RE.search(text):
+        return text.strip()
+    text = _COLOR_RUN_RE.sub("", text)
+    text = _COLOR_RE.sub("", text)
+    parts = re.split(r"([;,.:])", text)
+    kept = []
+    for i in range(0, len(parts), 2):
+        segment = re.sub(r"\s+", " ", parts[i]).strip()
+        delimiter = parts[i + 1] if i + 1 < len(parts) else ""
+        if segment.lower() in _FILLER_SEGMENTS:
+            continue
+        kept.append(segment + delimiter)
+    return re.sub(r"[;,:]+$", "", " ".join(kept).strip()).strip()
 
 
 # --- Abstraction labels ------------------------------------------------------------------
