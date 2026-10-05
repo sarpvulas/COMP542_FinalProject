@@ -7,12 +7,12 @@ import torch
 from transformers import T5Tokenizer, T5ForConditionalGeneration
 
 from board_text import parse_board, score_boards
-from hexagons_common import add_seed_arg, model_input, set_seed
+from hexagons_common import add_seed_arg, model_input, set_seed, set_truncation_side
 
 
 def load_model_and_tokenizer(model_path, device):
     model = T5ForConditionalGeneration.from_pretrained(model_path).to(device)
-    tokenizer = T5Tokenizer.from_pretrained(model_path)
+    tokenizer = set_truncation_side(T5Tokenizer.from_pretrained(model_path), 'left')  # as in training
     return model, tokenizer
 
 

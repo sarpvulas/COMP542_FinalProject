@@ -43,7 +43,7 @@ def parse_board(text, max_label=7):
         if len(tokens) != COLS:
             return None, f"row {i + 1}: expected {COLS} cells, got {len(tokens)}"
         for tok in tokens:
-            if not tok.isdigit() or not 0 <= int(tok) <= max_label:
+            if not (tok.isascii() and tok.isdigit()) or not 0 <= int(tok) <= max_label:
                 return None, f"row {i + 1}: bad label {tok!r}"
             board.append(int(tok))
     return board, None

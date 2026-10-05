@@ -386,3 +386,79 @@ def test_bilstm_mixed_batch_matches_single():
     both = model(ids, mask)
     assert torch.allclose(both[1], model(*padded([7, 2], 2))[0], atol=1e-5)
     assert torch.allclose(both[0], model(*padded([5, 9, 3, 12], 4))[0], atol=1e-5)
+
+
+# ---- truncation side, target length, strict digits ---------------------------------------------
+def word_tokenizer(n_words=200):
+    """A tiny offline fast tokenizer (word-level, w0..w{n-1}) that supports truncation_side."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    vocab = {"<pad>": 0, "<unk>": 1, "</s>": 2, "draw": 3, "board:": 4, "[SEP]": 5}
+    vocab.update({f"w{i}": 6 + i for i in range(n_words)})
+    raw = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
+    raw.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    return PreTrainedTokenizerFast(tokenizer_object=raw, pad_token="<pad>", unk_token="<unk>", eos_token="</s>")
+
+
+def long_history_table(tmp_path, n_steps=30):
+    steps = [f"w{i}" for i in range(n_steps)]
+    df = pd.DataFrame([dict(dataset="train", id_of_drawing=1, step_number=i + 1, abstraction_level="simple",
+                            instructions=steps[i], resulting_labels=str(board((i, 3))))
+                       for i in range(n_steps)])
+    path = tmp_path / "long.xlsx"
+    p5.build_t5_table(df).to_excel(path)
+    return path
+
+
+def test_long_history_keeps_current_instruction_and_drops_earliest(tmp_path):
+    path = long_history_table(tmp_path)
+    tok = word_tokenizer()
+    ds = t5.HexagonsDataset(str(path), "train", tok, max_length=20)
+    last = ds[len(ds) - 1]
+    text = tok.decode(last["input_ids"], skip_special_tokens=True)
+    assert text.split()[-1] == "w29"                 # the current step survives
+    assert "w0" not in text.split() and "draw" not in text   # the earliest history (and the prompt) is cut
+    assert tok.truncation_side == "right"             # restored for the label encoding
+    # a short history is untouched
+    first = tok.decode(ds[0]["input_ids"], skip_special_tokens=True)
+    assert first == "draw board: w0"
+
+
+def test_inference_truncates_from_the_left_too():
+    tok = hc.set_truncation_side(word_tokenizer(), "left")
+    ids = tok(" ".join(f"w{i}" for i in range(50)), truncation=True, max_length=10)["input_ids"]
+    assert tok.decode(ids).split()[-1] == "w49"
+    src = (PROJECT / "inference.py").read_text()
+    assert "set_truncation_side" in src and "'left'" in src
+
+
+def test_generate_inference_batch_runs_with_left_truncation():
+    from transformers import T5Config, T5ForConditionalGeneration
+    torch.manual_seed(0)
+    cfg = T5Config(vocab_size=300, d_model=16, d_kv=4, d_ff=32, num_layers=1, num_heads=2,
+                   decoder_start_token_id=0, pad_token_id=0, eos_token_id=2)
+    model = T5ForConditionalGeneration(cfg)
+    tok = hc.set_truncation_side(word_tokenizer(), "left")
+    out = inference.generate_inference_batch(model, tok, ["draw board: " + " ".join(f"w{i}" for i in range(40))],
+                                             torch.device("cpu"), max_length=12)
+    assert len(out) == 1 and isinstance(out[0], str)
+
+
+def test_check_target_length_warns_when_targets_would_be_cut():
+    tok = word_tokenizer()
+    targets = [" ".join(["w1"] * 30), "w2"]
+    with pytest.warns(UserWarning, match="truncated"):
+        assert t5.check_target_length(tok, targets, max_length=20) == 30
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        t5.check_target_length(tok, targets, max_length=64)
+
+
+def test_parse_board_rejects_non_ascii_digits():
+    text = bt.render_board(board())
+    assert bt.parse_board(text)[0] is not None
+    assert "٣".isdigit()                      # ARABIC-INDIC DIGIT THREE passes str.isdigit
+    bad = text.replace("0", "٣", 1)
+    parsed, reason = bt.parse_board(bad)
+    assert parsed is None and "bad label" in reason

@@ -23,6 +23,13 @@ def with_abstraction_level(t5_input, level):
     return f"Abstraction Level: {level} {t5_input}"
 
 
+def set_truncation_side(tokenizer, side):
+    """Choose which end of an over-long text is cut. Inputs are cut from the LEFT: the history
+    ends with the current step's instruction, which must survive; targets are cut from the right."""
+    tokenizer.truncation_side = side
+    return tokenizer
+
+
 def model_input(t5_instr, abstraction_level=None, include_abstraction_level=False):
     """The exact string fed to T5, for training (T5_Training.py) and inference (inference.py)."""
     if include_abstraction_level:
