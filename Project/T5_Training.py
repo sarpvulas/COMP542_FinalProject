@@ -6,12 +6,11 @@ from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 import time
 import argparse
+import warnings
+
+from hexagons_common import add_seed_arg, model_input, set_seed, set_truncation_side
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
-
-tokenizer = T5Tokenizer.from_pretrained("google/t5-v1_1-base")
-model = T5ForConditionalGeneration.from_pretrained("google/t5-v1_1-base").to(device)
 
 
 class HexagonsDataset(Dataset):
@@ -79,9 +78,9 @@ class HexagonsDataset(Dataset):
         else:
             instruction = str(item['t5_instr'])
             label = str(item['resulting_label_list'])
-            if self.include_abstraction_level:
-                instruction = f"Abstraction Level: {item['abstraction_level']} {instruction}"
+            instruction = model_input(instruction, item['abstraction_level'], self.include_abstraction_level)
 
+        set_truncation_side(self.tokenizer, 'left')  # keep the current (last) instruction of a long history
         input_encoding = self.tokenizer(
             instruction,
             padding='max_length',
@@ -90,6 +89,7 @@ class HexagonsDataset(Dataset):
             return_tensors="pt"
         )
 
+        set_truncation_side(self.tokenizer, 'right')
         label_encoding = self.tokenizer(
             label,
             padding='max_length',
@@ -108,8 +108,20 @@ class HexagonsDataset(Dataset):
         }
 
 
+def check_target_length(tokenizer, targets, max_length):
+    """Warn when `max_length` is smaller than the longest target (it would be cut silently).
+
+    Returns the longest target length in tokens (with the end-of-sequence token).
+    """
+    longest = max(len(ids) for ids in tokenizer(list(targets), truncation=False)['input_ids'])
+    if max_length < longest:
+        warnings.warn(f"--max_length {max_length} is smaller than the longest board target "
+                      f"({longest} tokens): targets will be truncated", stacklevel=2)
+    return longest
+
+
 def create_dataloader(file_path, dataset_type, tokenizer, batch_size=4, include_abstraction_level=False,
-                      no_color=False):
+                      no_color=False, shuffle=False, max_length=512):
     """
     Create a DataLoader for the given dataset.
 
@@ -120,13 +132,55 @@ def create_dataloader(file_path, dataset_type, tokenizer, batch_size=4, include_
         batch_size (int, optional): Batch size for DataLoader. Defaults to 4.
         include_abstraction_level (bool, optional): Include abstraction level in input. Defaults to False.
         no_color (bool, optional): Use dataset without color info. Defaults to False.
+        shuffle (bool, optional): Shuffle (train only). Defaults to False.
+        max_length (int, optional): Max token length of input and target. Defaults to 512.
 
     Returns:
         DataLoader: DataLoader for the dataset.
     """
-    dataset = HexagonsDataset(file_path, dataset_type, tokenizer, include_abstraction_level=include_abstraction_level,
-                              no_color=no_color)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataset = HexagonsDataset(file_path, dataset_type, tokenizer, max_length=max_length,
+                              include_abstraction_level=include_abstraction_level, no_color=no_color)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+def train_epoch(model, dataloader, optimizer, scheduler, device, max_batches=None):
+    """Train the model for one epoch (at most `max_batches` batches if given). Returns the mean loss."""
+    model.train()
+    total_loss = 0
+    n = 0
+    for batch in dataloader:
+        if max_batches is not None and n >= max_batches:
+            break
+        optimizer.zero_grad()
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        total_loss += loss.item()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        n += 1
+    return total_loss / max(n, 1)
+
+
+def evaluate(model, dataloader, device, max_batches=None):
+    """Mean loss over a dataloader (at most `max_batches` batches if given), no gradient."""
+    model.eval()
+    total_loss = 0
+    n = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            if max_batches is not None and n >= max_batches:
+                break
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            total_loss += outputs.loss.item()
+            n += 1
+    return total_loss / max(n, 1)
 
 
 def main(args):
@@ -136,78 +190,32 @@ def main(args):
     Args:
         args (argparse.Namespace): Command-line arguments.
     """
-    train_dataloader = create_dataloader(args.data_file, 'train', tokenizer,
-                                         include_abstraction_level=args.include_abstraction_level,
-                                         no_color=args.no_color)
-    val_dataloader = create_dataloader(args.data_file, 'dev', tokenizer,
-                                       include_abstraction_level=args.include_abstraction_level, no_color=args.no_color)
-    test_dataloader = create_dataloader(args.data_file, 'test', tokenizer,
-                                        include_abstraction_level=args.include_abstraction_level,
-                                        no_color=args.no_color)
+    set_seed(args.seed)
+    tokenizer = T5Tokenizer.from_pretrained(args.model_name)
+    model = T5ForConditionalGeneration.from_pretrained(args.model_name).to(device)
+    print(device)
+
+    target_column = 'resulting_label_list_no_color' if args.no_color else 'resulting_label_list'
+    all_targets = pd.read_excel(args.data_file, index_col=0)[target_column].astype(str)
+    longest = check_target_length(tokenizer, all_targets, args.max_length)
+    print(f"Longest board target: {longest} tokens (max_length {args.max_length})")
+
+    common = dict(include_abstraction_level=args.include_abstraction_level, no_color=args.no_color,
+                  batch_size=args.batch_size, max_length=args.max_length)
+    train_dataloader = create_dataloader(args.data_file, 'train', tokenizer, shuffle=True, **common)
+    val_dataloader = create_dataloader(args.data_file, 'dev', tokenizer, **common)
+    test_dataloader = create_dataloader(args.data_file, 'test', tokenizer, **common)
 
     optimizer = AdamW(model.parameters(), lr=3e-5)
     num_training_steps = len(train_dataloader) * args.epochs
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=num_training_steps)
 
-    def train_epoch(model, dataloader, optimizer, scheduler, device):
-        """
-        Train the model for one epoch.
-
-        Args:
-            model (T5ForConditionalGeneration): Model to train.
-            dataloader (DataLoader): DataLoader for training data.
-            optimizer (AdamW): Optimizer.
-            scheduler (get_linear_schedule_with_warmup): Learning rate scheduler.
-            device (torch.device): Device to train on (CPU or GPU).
-
-        Returns:
-            float: Average training loss for the epoch.
-        """
-        model.train()
-        total_loss = 0
-        for batch in dataloader:
-            optimizer.zero_grad()
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
-            total_loss += loss.item()
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-        return total_loss / len(dataloader)
-
-    def evaluate(model, dataloader, device):
-        """
-        Evaluate the model on validation data.
-
-        Args:
-            model (T5ForConditionalGeneration): Model to evaluate.
-            dataloader (DataLoader): DataLoader for validation data.
-            device (torch.device): Device to evaluate on (CPU or GPU).
-
-        Returns:
-            float: Average validation loss.
-        """
-        model.eval()
-        total_loss = 0
-        with torch.no_grad():
-            for batch in dataloader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss
-                total_loss += loss.item()
-        return total_loss / len(dataloader)
-
     best_val_loss = float('inf')
     for epoch in range(args.epochs):
         start_time = time.time()
 
-        train_loss = train_epoch(model, train_dataloader, optimizer, scheduler, device)
-        val_loss = evaluate(model, val_dataloader, device)
+        train_loss = train_epoch(model, train_dataloader, optimizer, scheduler, device, args.max_batches)
+        val_loss = evaluate(model, val_dataloader, device, args.max_batches)
 
         end_time = time.time()
         epoch_duration = end_time - start_time
@@ -217,7 +225,7 @@ def main(args):
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            checkpoint_name = f't5_model_checkpoint_{epoch + 1}_{"with_abstraction" if args.include_abstraction_level else "no_abstraction"}_{"no_color" if args.no_color else "with_color"}'
+            best_checkpoint = checkpoint_name = f't5_model_checkpoint_{epoch + 1}_{"with_abstraction" if args.include_abstraction_level else "no_abstraction"}_{"no_color" if args.no_color else "with_color"}'
             model.save_pretrained(checkpoint_name)
             tokenizer.save_pretrained(checkpoint_name)
             print(f"Model and tokenizer saved at epoch {epoch + 1} with validation loss {val_loss}")
@@ -227,15 +235,28 @@ def main(args):
     tokenizer.save_pretrained(final_model_name)
     print("Model training complete and saved.")
 
+    # One evaluation on the test split, with the best-dev-loss checkpoint (behaviour change:
+    # the test loader used to be built and never used).
+    if best_val_loss < float('inf'):
+        best_model = T5ForConditionalGeneration.from_pretrained(best_checkpoint).to(device)
+        test_loss = evaluate(best_model, test_dataloader, device, args.max_batches)
+        print(f"Test loss ({best_checkpoint}): {test_loss}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Train T5 model on Hexagons dataset with optional abstraction levels and no color information.')
-    parser.add_argument('--data_file', type=str, required=True, help='Path to the dataset file.')
+    parser.add_argument('--data_file', type=str, required=True, help='Path to the Excel file written by prepare_t5_data.py.')
     parser.add_argument('--include_abstraction_level', action='store_true',
                         help='Include abstraction levels in the input.')
     parser.add_argument('--no_color', action='store_true', help='Use no color information dataset.')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs.')
+    parser.add_argument('--model_name', type=str, default='google/t5-v1_1-base', help='Hugging Face model id.')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size.')
+    parser.add_argument('--max_length', type=int, default=512, help='Max tokens for input and target.')
+    parser.add_argument('--max_batches', type=int, default=None,
+                        help='Stop each train/eval pass after this many batches (smoke tests).')
+    add_seed_arg(parser)
 
     args = parser.parse_args()
     main(args)

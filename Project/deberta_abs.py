@@ -1,35 +1,18 @@
-import torch
-from torch.utils.data import DataLoader, Dataset
-from torch.optim import AdamW, Adam
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from transformers import get_scheduler
+import argparse
+
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, f1_score
-from tqdm import tqdm
-from torch.optim import Adam
+import torch
 from torch.nn import CrossEntropyLoss
+from torch.optim import Adam
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
+from hexagons_common import (add_seed_arg, class_weights, load_abstraction_df, majority_baseline,
+                             metrics_dict, set_seed)
 
-df = pd.read_excel("df_no_color.xlsx", index_col=0)
+NUM_CLASSES = 4
 
-abstraction_levels = {
-    'simple': 0,
-    'symmetry': 1,
-    'other': 1,
-    'composed objects': 2,
-    'conditions': 2,
-    'bounded iteration': 3,
-    'conditional iteration': 3,
-    'recursion': 3,
-    'NONE': 2
-}
-
-df["abstraction_label"] = df["abstraction_level"].map(abstraction_levels)
-df = df[~df["instructions"].isna()] # 1 instance like this
-
-train_df = df[df["dataset"] == "train"].copy(deep=True)
-dev_df = df[df["dataset"] == "dev"].copy(deep=True)
 
 # Custom dataset
 class TextDataset(Dataset):
@@ -58,30 +41,9 @@ class TextDataset(Dataset):
             'labels': torch.tensor(label, dtype=torch.long)
         }
 
-model_id = "microsoft/mdeberta-v3-base"
-
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-model = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=4)
-
-# Create dataset objects
-train_dataset = TextDataset(train_df, tokenizer)
-valid_dataset = TextDataset(dev_df, tokenizer)
-
-# Create dataloaders
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-valid_loader = DataLoader(valid_dataset, batch_size=8, shuffle=False)
-
-optimizer = Adam(model.parameters(), lr=4e-5)
-loss_fn = CrossEntropyLoss()
-
-# Setup device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using {device} for training")
-model.to(device)
-
-model_save_path = "deberta_abstraction"
 
 print_per = 100
+
 
 # Training loop
 def train(model, data_loader, loss_fn, optimizer, device):
@@ -105,6 +67,7 @@ def train(model, data_loader, loss_fn, optimizer, device):
     print(f"Average Training Loss: {average_loss:.4f}")
     return average_loss
 
+
 # Validation loop
 def validate(model, data_loader, loss_fn, device):
     model = model.eval()
@@ -118,28 +81,20 @@ def validate(model, data_loader, loss_fn, device):
             outputs = model(input_ids, attention_mask=attention_mask)
             loss = loss_fn(outputs.logits, labels)
             total_loss += loss.item()
-            if (batch_idx + 1) % print_per == 0:  # print every 10 batches
+            if (batch_idx + 1) % print_per == 0:
                 print(f"Validation Batch {batch_idx + 1}/{total_batches}, Batch Loss: {loss.item():.4f}")
     average_loss = total_loss / total_batches
     print(f"Average Validation Loss: {average_loss:.4f}")
     return average_loss
-
-for epoch in range(20):
-    print(f"Epoch {epoch + 1}")
-    train_loss = train(model, train_loader, loss_fn, optimizer, device)
-    valid_loss = validate(model, valid_loader, loss_fn, device)
-    print(f'Epoch {epoch + 1}, Train Loss: {train_loss:.4f}, Valid Loss: {valid_loss:.4f}')
-
-torch.save(model.state_dict(), f"{model_save_path}.pth")
 
 
 def preprocess(texts, tokenizer, max_length=512):
     # Tokenize the text input for the model
     return tokenizer(texts, padding="max_length", truncation=True, max_length=max_length, return_tensors="pt")
 
+
 def validate_on_strings(model, texts, tokenizer, device):
     model = model.eval()
-    total_loss = 0
     data_loader = DataLoader(texts, batch_size=10)
     predictions = []
     with torch.no_grad():
@@ -148,28 +103,69 @@ def validate_on_strings(model, texts, tokenizer, device):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             outputs = model(input_ids, attention_mask=attention_mask)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=-1)
+            probs = torch.softmax(outputs.logits, dim=-1)
             predictions.extend(probs.tolist())
     return predictions
 
 
-texts = df["instructions"].values
-predictions = validate_on_strings(model, texts, tokenizer, device)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="mDeBERTa abstraction-level classifier (4 groups).")
+    parser.add_argument("--input_file", default="df_no_color.xlsx")
+    parser.add_argument("--output_file", default="deberta_results.xlsx")
+    parser.add_argument("--model_path", default="deberta_abstraction.pth")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=4e-5)
+    parser.add_argument("--class_weighted", action="store_true",
+                        help="Weight the loss by inverse class frequency.")
+    add_seed_arg(parser)
+    args = parser.parse_args(argv)
 
-df["bert_preds"] = predictions
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    set_seed(args.seed)
+    df = load_abstraction_df(args.input_file)
+    train_df = df[df["dataset"] == "train"].copy(deep=True)
+    dev_df = df[df["dataset"] == "dev"].copy(deep=True)
 
-df.to_excel("deberta_results.xlsx")
+    model_id = "microsoft/mdeberta-v3-base"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=NUM_CLASSES)
 
-df["bert_preds_final"] = [np.argmax(i) for i in df["bert_preds"]]
+    generator = torch.Generator().manual_seed(args.seed)
+    train_loader = DataLoader(TextDataset(train_df, tokenizer), batch_size=args.batch_size, shuffle=True, generator=generator)
+    valid_loader = DataLoader(TextDataset(dev_df, tokenizer), batch_size=args.batch_size, shuffle=False)
 
-def calculate_metrics(group):
-    accuracy = accuracy_score(group['abstraction_label'], group['bert_preds_final'])
-    f1 = f1_score(group['abstraction_label'], group['bert_preds_final'], average='macro')
-    return pd.Series({'Accuracy': accuracy, 'F1 Score': f1})
+    optimizer = Adam(model.parameters(), lr=args.lr)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using {device} for training")
+    model.to(device)
+    weight = None
+    if args.class_weighted:
+        weight = class_weights(train_df["abstraction_label"].values, NUM_CLASSES).to(device)
+        print(f"Class weights: {weight.tolist()}")
+    loss_fn = CrossEntropyLoss(weight=weight)
 
-# Calculate metrics for each dataset group
-results = df.groupby('dataset').apply(calculate_metrics)
+    for epoch in range(args.epochs):
+        print(f"Epoch {epoch + 1}")
+        train_loss = train(model, train_loader, loss_fn, optimizer, device)
+        valid_loss = validate(model, valid_loader, loss_fn, device)
+        print(f'Epoch {epoch + 1}, Train Loss: {train_loss:.4f}, Valid Loss: {valid_loss:.4f}')
 
-print(results)
+    torch.save(model.state_dict(), args.model_path)
 
+    df["bert_preds"] = validate_on_strings(model, df["instructions"].values, tokenizer, device)
+    df.to_excel(args.output_file)
+    df["bert_preds_final"] = [np.argmax(i) for i in df["bert_preds"]]
+
+    train_labels = df.loc[df["dataset"] == "train", "abstraction_label"]
+    rows = []
+    for split, group in df.groupby("dataset", sort=False):
+        m = metrics_dict(group["abstraction_label"].tolist(), group["bert_preds_final"].tolist())
+        b = majority_baseline(train_labels, group["abstraction_label"].tolist())
+        rows.append({"split": split, "n": m["n"], "accuracy": m["accuracy"], "macro_f1": m["macro_f1"],
+                     "majority_accuracy": b["accuracy"], "majority_macro_f1": b["macro_f1"]})
+    print(pd.DataFrame(rows).set_index("split"))
+
+
+if __name__ == "__main__":
+    main()
