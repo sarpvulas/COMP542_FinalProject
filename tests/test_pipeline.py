@@ -9,7 +9,9 @@ import pytest
 import torch
 
 import action_classifier as ac
+import board_text as bt
 import hexagons_common as hc
+import inference
 import prepare_t5_data as p5
 import lstm_abs
 import T5_Training as t5
@@ -29,95 +31,187 @@ class StubTokenizer:
         return {"input_ids": torch.tensor([ids]), "attention_mask": torch.tensor([mask])}
 
 
+
+
+class RecordingTokenizer(StubTokenizer):
+    """Stub tokenizer that remembers every text it was asked to encode."""
+    def __init__(self):
+        self.seen = []
+
+    def __call__(self, text, **kw):
+        self.seen.append(text)
+        return super().__call__(text, **kw)
+
+
+def board(*filled):
+    """A 180-cell board; `filled` is (index, label) pairs."""
+    b = [0] * 180
+    for i, label in filled:
+        b[i] = label
+    return b
+
+
 def raw_df():
+    """Two drawings: 1 (train, 2 steps) and 2 (dev, 3 steps), with boards that grow step by step."""
     rows = []
     for drawing, n in [(1, 2), (2, 3)]:
+        filled = []
         for step in range(1, n + 1):
+            filled.append((step * 7 + drawing, 2 + step))
             rows.append(dict(dataset="train" if drawing == 1 else "dev", id_of_drawing=drawing,
                              step_number=step, abstraction_level="simple",
                              instructions=f"Color the red hexagon {drawing}.{step}",
-                             no_color=f"Color the hexagon {drawing}.{step}"))
+                             no_color=f"Color the hexagon {drawing}.{step}",
+                             resulting_labels=str(board(*filled))))
     return pd.DataFrame(rows)
 
 
-SEP = f"  {hc.STEP_MARKER}  "
+# ---- board text: rendering, parsing, scoring ------------------------------------------------
+def test_render_parse_round_trip_and_format():
+    b = board((0, 3), (17, 7), (18, 1), (179, 5))
+    text = bt.render_board(b)
+    assert text.count(" / ") == 9 and text.split(" / ")[0].startswith("3 0 0")
+    assert bt.parse_board(text) == (b, None)
+    assert bt.parse_board(f"  {text}\n")[0] == b  # outer whitespace is tolerated
 
 
-# ---- item 3: merge with length check -------------------------------------------------
-def test_merge_aligns_steps_and_reports_mismatch():
-    gpt = {1: SEP.join(["a1", "a2"]), 2: SEP.join(["b1", "b2"])}  # drawing 2 has 3 rows
-    out, bad = hc.merge_simplified(raw_df(), gpt)
-    assert bad == [2]
-    assert out.loc[out.id_of_drawing == 1, "simplified_instructions"].tolist() == ["a1", "a2"]
-    assert out.loc[out.id_of_drawing == 2, "simplified_instructions"].isna().all()
+def test_render_rejects_wrong_size():
+    with pytest.raises(ValueError):
+        bt.render_board([0] * 179)
 
 
-def test_merge_accepts_lists_and_missing_drawing():
-    out, bad = hc.merge_simplified(raw_df(), {1: ["a1", "a2"]})
-    assert bad == [2]
-    assert out["simplified_instructions"].notna().sum() == 2
+def test_collapse_board_maps_all_colours_to_filled():
+    assert bt.collapse_board([0, 1, 2, 7, 0, 5]) == [0, 1, 1, 1, 0, 1]
+    assert set(bt.collapse_board(list(range(8)) * 22 + [0] * 4)) == {0, 1}
 
 
-def test_merge_tolerates_marker_spacing():
-    out, bad = hc.merge_simplified(raw_df(), {1: f"a1 {hc.STEP_MARKER}\n\na2", 2: SEP.join("xyz")})
-    assert bad == []
-    assert out["simplified_instructions"].tolist() == ["a1", "a2", "x", "y", "z"]
+@pytest.mark.parametrize("bad", [
+    "", "not a board", None, 42,
+    " / ".join([" ".join(["0"] * 18)] * 9),                    # 9 rows
+    " / ".join([" ".join(["0"] * 17)] * 10),                    # short rows
+    " / ".join([" ".join(["0"] * 18)] * 9 + [" ".join(["0"] * 17 + ["8"])]),   # label 8
+    " / ".join([" ".join(["0"] * 18)] * 9 + [" ".join(["0"] * 17 + ["x"])]),   # not a number
+    " / ".join([" ".join(["0"] * 18)] * 9 + [" ".join(["0"] * 17 + ["-1"])]),  # negative
+])
+def test_parse_board_reports_malformed_without_raising(bad):
+    parsed, reason = bt.parse_board(bad)
+    assert parsed is None and isinstance(reason, str) and reason
+
+
+def test_parse_board_respects_max_label():
+    text = bt.render_board(board((3, 2)))
+    assert bt.parse_board(text, max_label=1)[0] is None
+
+
+def test_score_boards_hand_made_case():
+    gold = [board((0, 1), (1, 2)), board((5, 3)), board()]
+    exact = bt.render_board(gold[0])
+    one_wrong = bt.render_board(board((5, 3), (6, 3)))   # 1 extra cell -> 179/180 correct
+    result = bt.score_boards([exact, one_wrong, "garbage"], [bt.render_board(g) for g in gold])
+    assert result["n"] == 3 and result["n_malformed"] == 1 and list(result["errors"]) == [2]
+    assert result["exact_match"] == pytest.approx(1 / 3)
+    assert result["cell_accuracy"] == pytest.approx((180 + 179 + 0) / 540)
+    # blank board is right on every empty gold cell: 178 + 179 + 180 of 540
+    assert result["blank_board_cell_accuracy"] == pytest.approx((178 + 179 + 180) / 540)
+
+
+def test_score_boards_perfect_and_bad_gold():
+    texts = [bt.render_board(board((2, 4)))]
+    assert bt.score_boards(texts, texts)["exact_match"] == 1.0
+    with pytest.raises(ValueError):
+        bt.score_boards(texts, ["bad gold"])
+    with pytest.raises(ValueError):
+        bt.score_boards(texts, texts + texts)
+
+
+# ---- T5 data prep, one prompt, one target format --------------------------------------------
+def test_prepare_t5_table_columns_history_and_targets():
+    out = p5.build_t5_table(raw_df())
+    for col in p5.NEW_COLUMNS:
+        assert col in out.columns
+    d1 = out[out.id_of_drawing == 1].sort_values("step_number")
+    assert d1.t5_instr.tolist() == [
+        hc.build_t5_input("Color the red hexagon 1.1"),
+        hc.build_t5_input("Color the red hexagon 1.1 [SEP] Color the red hexagon 1.2")]
+    assert d1.t5_instr_no_color.iloc[1] == hc.build_t5_input("Color the hexagon 1.1 [SEP] Color the hexagon 1.2")
+    assert d1.t5_instr.iloc[0].startswith(hc.T5_PROMPT_PREFIX)
+    boards = [bt.parse_board(t)[0] for t in d1.resulting_label_list]
+    assert boards == [board((8, 3)), board((8, 3), (15, 4))]
+    nc = [bt.parse_board(t, max_label=1)[0] for t in d1.resulting_label_list_no_color]
+    assert nc == [bt.collapse_board(b) for b in boards]
+
+
+def test_prepare_without_gpt_column_skips_no_color_input():
+    out = p5.build_t5_table(raw_df().drop(columns="no_color"))
+    assert "t5_instr_no_color" not in out.columns and "resulting_label_list_no_color" in out.columns
+
+
+def test_prepare_accepts_list_boards_and_drops_missing_instruction():
+    df = raw_df()
+    df["resulting_labels"] = df["resulting_labels"].map(eval)
+    df.loc[0, "instructions"] = None
+    assert len(p5.build_t5_table(df)) == len(df) - 1
+
+
+def test_prepare_requires_columns_and_unique_index():
+    with pytest.raises(ValueError, match="columns"):
+        p5.build_t5_table(raw_df().drop(columns="resulting_labels"))
+    df = raw_df()
+    with pytest.raises(ValueError, match="index"):
+        p5.build_t5_table(pd.concat([df, df.iloc[:1]]))
+
+
+def test_training_and_inference_build_identical_inputs(tmp_path):
+    path = tmp_path / "t5.xlsx"
+    p5.build_t5_table(raw_df()).to_excel(path)
+    table = pd.read_excel(path, index_col=0)
+    for no_color, abstraction in [(False, False), (False, True), (True, False)]:
+        ds = t5.HexagonsDataset(str(path), "dev", RecordingTokenizer(), max_length=64,
+                                include_abstraction_level=abstraction, no_color=no_color)
+        train_inputs = []
+        for i in range(len(ds)):
+            ds[i]
+            train_inputs.append(ds.tokenizer.seen[-2])  # input text is encoded before the label
+        dev = table[table.dataset == "dev"]
+        col = "t5_instr_no_color" if no_color else "t5_instr"
+        infer_inputs = inference.build_inputs(dev, col, abstraction and not no_color)
+        assert train_inputs == infer_inputs
+    assert infer_inputs[0].startswith(hc.T5_PROMPT_PREFIX)
+    assert "simplify" not in (PROJECT / "inference.py").read_text()
+
+
+def test_t5_dataset_target_is_board_text(tmp_path):
+    path = tmp_path / "t5.xlsx"
+    table = p5.build_t5_table(raw_df())
+    table.to_excel(path)
+    tok = RecordingTokenizer()
+    t5.HexagonsDataset(str(path), "train", tok, max_length=64)[0]
+    assert bt.parse_board(tok.seen[-1])[0] is not None          # label text is a valid board text
+    nc_tok = RecordingTokenizer()
+    t5.HexagonsDataset(str(path), "train", nc_tok, max_length=64, no_color=True)[0]
+    assert bt.parse_board(nc_tok.seen[-1], max_label=1)[0] is not None
+
+
+def test_t5_dataset_masks_padding_in_labels(tmp_path):
+    path = tmp_path / "t5.xlsx"
+    p5.build_t5_table(raw_df()).to_excel(path)
+    item = t5.HexagonsDataset(str(path), "train", StubTokenizer(), max_length=400)[0]
+    assert item["labels"][-1] == -100 and item["labels"][0] != -100
+
+
+def test_inference_scores_malformed_outputs_without_crashing():
+    df = p5.build_t5_table(raw_df())
+    df["predicted_board_text"] = df["resulting_label_list"]
+    df.loc[df.index[1], "predicted_board_text"] = "oops"
+    result = inference.score_dataframe(df, "predicted_board_text", "resulting_label_list", 7)
+    assert result["n_malformed"] == 1 and list(result["errors"]) == [int(df.index[1])]
+    assert result["exact_match"] == pytest.approx((len(df) - 1) / len(df))
 
 
 def test_notebook_has_no_key_and_uses_env():
     nb = (PROJECT / "Data Preprocess.ipynb").read_text()
-    assert "MY_API_KEY" not in nb and "OPENAI_API_KEY" in nb and "merge_simplified" in nb
+    assert "MY_API_KEY" not in nb and "OPENAI_API_KEY" in nb
 
-
-# ---- items 1 and 2: T5 data prep and one prompt -----------------------------------------
-def test_prepare_t5_table_and_prompt():
-    gpt = {1: ["Color Red cell 1", "paint blue cell 2"], 2: ["c1", "c2", "c3"]}
-    df, _ = hc.merge_simplified(raw_df(), gpt)
-    df.loc[df.index[-1], "simplified_instructions"] = np.nan  # dropped row
-    out = p5.build_t5_table(df)
-    assert len(out) == 4
-    for col in p5.NEW_COLUMNS:
-        assert col in out.columns
-    first = out.iloc[0]
-    assert first.t5_instr == hc.build_t5_input("Color the red hexagon 1.1")
-    assert first.t5_instr.startswith(hc.T5_PROMPT_PREFIX)
-    assert first.t5_target == "Color Red cell 1"
-    assert first.t5_instr_no_color == hc.build_t5_input("Color the hexagon 1.1")
-    assert first.t5_target_no_color == "Color cell 1"
-    assert out.iloc[1].t5_target_no_color == "paint cell 2"
-
-
-def test_prepare_requires_columns():
-    with pytest.raises(ValueError):
-        p5.build_t5_table(raw_df())
-
-
-@pytest.mark.parametrize("text,expected", [
-    ("Make a green and yellow flower", "Make a flower"),
-    ("Color white hexagons black", "Color white hexagons"),
-    ("Paint the hexagon Red-orange", "Paint the hexagon"),
-    ("Fill in red; then blue", "Fill in"),
-    ("Make it Navy", "Make it"),
-    ("Use red, blue and green here.", "Use here."),
-    ("Make the hexagon green instead of red", "Make the hexagon instead of"),  # known ungrammatical case
-    ("colour of the sky", "colour of the sky"),
-    ("Redo the redwood row", "Redo the redwood row"),
-])
-def test_strip_colors_examples(text, expected):
-    assert hc.strip_colors(text) == expected
-
-
-def test_merge_rejects_duplicates_and_strips_numbering():
-    df = raw_df()
-    dup_index = pd.concat([df, df.iloc[:1]])
-    with pytest.raises(ValueError, match="unique"):
-        hc.merge_simplified(dup_index, {})
-    dup_step = pd.concat([df, df.iloc[:1]], ignore_index=True)
-    with pytest.raises(ValueError, match="step_number"):
-        hc.merge_simplified(dup_step, {})
-    out, bad = hc.merge_simplified(df, {1: SEP.join(["1. a", "2) b"]), 2: ["Step 1. x", "y 3. z", "3.5 cells"]})
-    assert bad == []
-    assert out["simplified_instructions"].tolist() == ["a", "b", "x", "y 3. z", "3.5 cells"]
 
 
 def test_make_abstraction_xlsx_from_tiny_jsonl(tmp_path):
@@ -138,28 +232,6 @@ def test_make_abstraction_xlsx_from_tiny_jsonl(tmp_path):
     loaded = hc.load_abstraction_df(out)  # the loader used by lstm_abs.py
     assert loaded["abstraction_label"].tolist() == [0, 0, 2, 2, 3, 3]
 
-
-def test_inference_uses_shared_prompt():
-    src = (PROJECT / "inference.py").read_text()
-    assert "build_t5_input" in src and "simplify instructions" not in src
-
-
-def test_t5_dataset_trains_on_simplified_target(tmp_path):
-    gpt = {1: ["Color Red cell 1", "paint blue cell 2"], 2: ["c1", "c2", "c3"]}
-    df, _ = hc.merge_simplified(raw_df(), gpt)
-    path = tmp_path / "t5.xlsx"
-    p5.build_t5_table(df).to_excel(path)
-    tok = StubTokenizer()
-    ds = t5.HexagonsDataset(str(path), "train", tok, max_length=16)
-    item = ds[0]
-    expect_in = tok(hc.build_t5_input("Color the red hexagon 1.1"))["input_ids"][0]
-    assert torch.equal(item["input_ids"], expect_in)
-    target = item["labels"]
-    expected = tok("Color Red cell 1")["input_ids"][0]
-    assert torch.equal(target[target != -100], expected[expected != 0])
-    assert target[-1] == -100  # padding ignored in the loss
-    nc = t5.HexagonsDataset(str(path), "train", tok, max_length=16, no_color=True)
-    assert nc[0]["labels"][0] != -100
 
 
 def test_t5_train_and_test_evaluation_run_on_tiny_model():
@@ -226,7 +298,7 @@ def test_set_seed_reproducible():
 
 @pytest.mark.parametrize("script", ["classificationbased.py", "classificationbased_nocolor.py",
                                     "classificationbased-abstraction.py", "classification_evaluation.py",
-                                    "deberta_abs.py", "lstm_abs.py", "T5_Training.py", "prepare_t5_data.py"])
+                                    "deberta_abs.py", "lstm_abs.py", "T5_Training.py", "prepare_t5_data.py", "inference.py"])
 def test_cli_help_lists_seed_and_file_args(script):
     out = subprocess.run([sys.executable, str(PROJECT / script), "--help"], capture_output=True, text=True,
                          cwd=PROJECT)
