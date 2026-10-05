@@ -98,10 +98,13 @@ class HexagonsDataset(Dataset):
             return_tensors="pt"
         )
 
+        labels = label_encoding['input_ids'].squeeze(0)
+        labels[labels == self.tokenizer.pad_token_id] = -100  # ignore padding in the loss
+
         return {
             'input_ids': input_encoding['input_ids'].squeeze(0),
             'attention_mask': input_encoding['attention_mask'].squeeze(0),
-            'labels': label_encoding['input_ids'].squeeze(0)
+            'labels': labels
         }
 
 
