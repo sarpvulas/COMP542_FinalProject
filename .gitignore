@@ -171,3 +171,4 @@ cython_debug/
 t5_model_checkpoint_*/
 t5_final_model_*/
 Hexagons/
+.ipynb_checkpoints/
